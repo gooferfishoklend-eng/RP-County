@@ -53,7 +53,9 @@ class TurnOutcome:
     changes: dict[int, dict] = field(default_factory=dict)
     collapses: list[str] = field(default_factory=list)
     eliminated: list[dict] = field(default_factory=list)
-    npc_messages: list[tuple[dict, str]] = field(default_factory=list)
+    npc_messages: list[tuple[dict, str, dict | None]] = field(default_factory=list)
+    npc_dms: list[tuple[dict, dict, str]] = field(default_factory=list)
+    summits: list[dict] = field(default_factory=list)
     support_lines: list[str] = field(default_factory=list)
     event_lines: list[str] = field(default_factory=list)
 
@@ -427,10 +429,28 @@ async def resolve_turn(db: Database, gm: GameMaster, chat_id: int, rng: random.R
             outcome.event_lines.append(f"🆕 {EVENT_ICONS.get(ev['kind'], '🌐')} {ev['name']}: {ev['description']}")
 
     if game["npc_chat"]:
-        for msg in result["npc_messages"][:6]:
+        for msg in result["npc_messages"][:8]:
             c = by_id.get(msg["country_id"])
-            if c and not c["user_id"]:
-                outcome.npc_messages.append((c, msg["text"]))
+            if not c or c["user_id"]:
+                continue
+            target = by_id.get(msg.get("to_country_id") or 0)
+            target = target if target and target["id"] != c["id"] else None
+            outcome.npc_messages.append((c, msg["text"], target))
+            if target:
+                await db.remember(chat_id, turn, c["id"], target["id"], "say", c["name"], msg["text"])
+                if not target["user_id"]:
+                    await db.remember(chat_id, turn, target["id"], c["id"], "say", c["name"], msg["text"])
+        for dm in result.get("npc_private_messages", [])[:3]:
+            sender, receiver = by_id.get(dm["from_id"]), by_id.get(dm["to_id"])
+            if sender and receiver and not sender["user_id"] and receiver["user_id"]:
+                outcome.npc_dms.append((sender, receiver, dm["text"]))
+                await db.remember(chat_id, turn, sender["id"], receiver["id"], "talk", sender["name"], dm["text"], True)
+        for summit in result.get("summits", [])[:1]:
+            host = by_id.get(summit["initiator_id"])
+            guests = [by_id[i] for i in dict.fromkeys(summit["invitee_ids"]) if i in by_id and i != summit["initiator_id"]]
+            if host and not host["user_id"] and any(g["user_id"] for g in guests):
+                outcome.summits.append({"host": host, "guests": guests[:7], "topic": summit["topic"],
+                                        "opening": summit["opening"]})
 
     if result.get("chronicle_summary"):
         await db.set_history(chat_id, result["chronicle_summary"][:4000])

@@ -187,3 +187,29 @@ async def test_upgrade_from_v3_keeps_game_and_repairs_peace(tmp_path):
     await db.close()
     import glob
     assert glob.glob(path + ".schema-v3-*.bak")
+
+
+async def test_npcs_talk_to_each_other_and_call_summits(db):
+    ukr = await take(db, 1, "UKR")
+    chn, ind = await db.get_country_by_code(CHAT, "CHN"), await db.get_country_by_code(CHAT, "IND")
+
+    class TalkGM(FakeGM):
+        async def resolve_turn(self, world, **kw):
+            out = await super().resolve_turn(world, **kw)
+            out["npc_messages"] = [{"country_id": chn["id"], "to_country_id": ind["id"], "text": "Обсудим границу?"},
+                                   {"country_id": ind["id"], "to_country_id": 0, "text": "Мы за мир."}]
+            out["npc_private_messages"] = [{"from_id": chn["id"], "to_id": ukr["id"], "text": "Есть сделка."},
+                                           {"from_id": chn["id"], "to_id": ind["id"], "text": "НИП-НИП в ЛС не шлём"}]
+            out["summits"] = [{"initiator_id": chn["id"], "topic": "Пандемия", "invitee_ids": [ukr["id"], ind["id"]],
+                               "opening": "Созываю саммит."}]
+            return out
+
+    outcome = await resolve_turn(db, TalkGM(), CHAT)
+    assert [(c["name"], t["name"] if t else None) for c, _, t in outcome.npc_messages] == [("Китай", "Индия"), ("Индия", None)]
+    assert [(s["name"], r["name"]) for s, r, _ in outcome.npc_dms] == [("Китай", "Украина")]
+    assert outcome.summits[0]["host"]["name"] == "Китай" and len(outcome.summits[0]["guests"]) == 2
+    assert [m["text"] for m in await db.recall(CHAT, ind["id"], chn["id"])] == ["Обсудим границу?"]
+
+    await db.set_game_flag(CHAT, "npc_chat", False)
+    outcome = await resolve_turn(db, TalkGM(), CHAT)
+    assert outcome.npc_messages == [] and outcome.npc_dms == [] and outcome.summits == []

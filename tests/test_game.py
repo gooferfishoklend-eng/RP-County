@@ -203,7 +203,7 @@ async def test_events_created_and_updated(db):
     outcome = await resolve_turn(db, gm, CHAT)
     events = await db.active_events(CHAT)
     assert events and events[0]["affected"] == [china["id"]]
-    assert [c["code"] for c, _ in outcome.npc_messages] == ["CHN"]
+    assert [c["code"] for c, _, _ in outcome.npc_messages] == ["CHN"]
 
     upd = {**new, "event_id": events[0]["id"], "severity": 70, "status": "ended"}
     await resolve_turn(db, FakeGM(events=[upd]), CHAT)

@@ -231,15 +231,24 @@ async def cmd_conference(message: Message, command: CommandObject, bot: Bot, db:
         await message.answer(f"Не больше {MAX_PARTIES} участников.")
         return
 
+    error = await open_conference(bot, db, chat_id, game["turn"], me, parties, topic)
+    if error:
+        await message.answer(error)
+    elif is_private(message):
+        await message.answer("Конференция созвана, приглашения разосланы.")
+
+
+async def open_conference(bot: Bot, db: Database, chat_id: int, turn: int, initiator: dict, parties: dict[int, dict],
+                          topic: str, *, emergency: bool = False, opening: str | None = None) -> str | None:
+    """Take a free room, invite the parties and announce it. Returns an error text, or None on success."""
     room = next((r for r in await db.list_rooms(chat_id) if not r["conference_id"]), None)
     if not room:
-        await message.answer("Все комнаты переговоров заняты или их нет. Админ может добавить комнату: /addroom")
-        return
+        return "Все комнаты переговоров заняты или их нет. Админ может добавить комнату: /addroom"
     topic = topic.strip()[:300] or "Мирная конференция"
-    conf_id = await db.create_conference(chat_id, room["room_chat_id"], topic, me["id"], game["turn"],
+    conf_id = await db.create_conference(chat_id, room["room_chat_id"], topic, initiator["id"], turn,
                                          [(c["id"], c["user_id"]) for c in parties.values()])
     await db.set_room_conference(room["room_chat_id"], conf_id)
-    title = "🕊 " + " — ".join(c["name"] for c in parties.values())
+    title = ("🚨 " if emergency else "🕊 ") + " — ".join(c["name"] for c in parties.values())
     try:
         await bot.set_chat_title(room["room_chat_id"], title[:128])
     except TG_ERRORS:
@@ -250,33 +259,35 @@ async def cmd_conference(message: Message, command: CommandObject, bot: Bot, db:
     except TG_ERRORS:
         await db.set_room_conference(room["room_chat_id"], None)
         await db.update_conference(conf_id, status="closed")
-        await message.answer("⚠️ Не могу создать ссылку в комнате — проверьте мои права администратора там.")
-        return
+        return "⚠️ Не могу создать ссылку в комнате — проверьте мои права администратора там."
     await db.update_conference(conf_id, invite_link=link.invite_link)
 
     roster = "\n".join(
         f"{c['flag']} {escape(c['name'])} — " + (escape(c['player_name'] or '') if c["user_id"] else "делегация ИИ")
         for c in parties.values())
+    kind = "Экстренный саммит" if emergency else "Конференция"
     await room_say(bot, db, conf_id, room["room_chat_id"],
-                   f"🕊 <b>Конференция №{conf_id}</b>\nТема: {escape(topic)}\n\n<b>Участники:</b>\n{roster}\n\n"
+                   f"{'🚨' if emergency else '🕊'} <b>{kind} №{conf_id}</b>\nТема: {escape(topic)}\n\n<b>Участники:</b>\n{roster}\n\n"
                    "Ведите переговоры обычными сообщениями. Делегации ИИ сами понимают, к кому вы обращаетесь, и отвечают (один на один — на каждое сообщение).\n"
                    "Когда договоритесь — /draft: ИИ проанализирует переговоры и составит договор.\n"
-                   "Если кто-то не подпишет — инициатор может заключить договор между подписавшими.\nЗакрыть без соглашения — /endconf.")
+                   "Если кто-то не подпишет — инициатор (или любой лидер, если созывала страна-ИИ) может заключить договор между подписавшими.\n"
+                   "Закрыть без соглашения — /endconf.")
+    if opening and not initiator["user_id"]:
+        await room_say(bot, db, conf_id, room["room_chat_id"], f"{initiator['flag']} {escape(initiator['name'])}: {escape(opening)}",
+                       kind="npc", country_id=initiator["id"], speaker=f"{initiator['name']} (делегация ИИ)", log_text=opening)
 
     kb = InlineKeyboardBuilder()
     kb.button(text="🚪 Войти в зал переговоров", url=link.invite_link)
-    await bot.send_message(
-        chat_id,
-        f"🕊 <b>{me['flag']} {escape(me['name'])} созывает конференцию №{conf_id}</b>\nТема: {escape(topic)}\n\n{roster}\n\n"
-        "Участники входят по кнопке ниже — бот пускает только приглашённых лидеров.",
-        reply_markup=kb.as_markup(),
-    )
+    head = (f"🚨 <b>{initiator['flag']} {escape(initiator['name'])} созывает экстренный саммит №{conf_id}!</b>" if emergency
+            else f"🕊 <b>{initiator['flag']} {escape(initiator['name'])} созывает конференцию №{conf_id}</b>")
+    await bot.send_message(chat_id, f"{head}\nТема: {escape(topic)}\n\n{roster}\n\n"
+                                    "Участники входят по кнопке ниже — бот пускает только приглашённых лидеров.",
+                           reply_markup=kb.as_markup())
     for c in parties.values():
         if c["user_id"]:
-            await send_dm(bot, c["user_id"], f"🕊 Вас пригласили на конференцию №{conf_id}: {escape(topic)}\n"
-                                             f"Вход: {link.invite_link}")
-    if is_private(message):
-        await message.answer("Конференция созвана, приглашения разосланы.")
+            await send_dm(bot, c["user_id"], f"{'🚨' if emergency else '🕊'} Вас пригласили: {kind.lower()} №{conf_id} — "
+                                             f"{escape(topic)}\nВход: {link.invite_link}")
+    return None
 
 
 @router.chat_join_request()
@@ -393,7 +404,8 @@ async def cb_sign(call: CallbackQuery, bot: Bot, db: Database, settings: Setting
     country = await db.get_country(member["country_id"])
 
     if action == "partial":
-        if member["country_id"] != conf["initiator_id"]:
+        initiator = await db.get_country(conf["initiator_id"])
+        if initiator and initiator["user_id"] and member["country_id"] != conf["initiator_id"]:
             await call.answer("Заключить договор без остальных может только инициатор конференции", show_alert=True)
             return
         signers = {m["country_id"] for m in members if m["signed"] == 1}

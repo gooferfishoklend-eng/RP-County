@@ -151,8 +151,13 @@ async def finish_turn(bot: Bot, db: Database, gm: GameMaster, settings: Settings
 
         if outcome.npc_messages:
             voices = ["💬 <b>Голоса мира</b>", ""]
-            voices += [f"{c['flag']} <b>{escape(c['name'])}:</b> {escape(text)}" for c, text in outcome.npc_messages]
+            for c, text, target in outcome.npc_messages:
+                to = f" → {target['flag']} {escape(target['name'])}" if target else ""
+                voices.append(f"{c['flag']} <b>{escape(c['name'])}</b>{to}: {escape(text)}")
             await send_long(bot, chat_id, "\n".join(voices))
+        for sender, receiver, text in outcome.npc_dms:
+            await send_dm(bot, receiver["user_id"], f"🔒 <b>Тайное послание от {sender['flag']} {escape(sender['name'])}</b>\n\n"
+                                                     f"{escape(text)}\n\nОтветить: <code>/talk {escape(sender['name'])} | …</code>")
 
         new_label = turn_label(game["turn"] + 1, settings.start_year)
         try:
@@ -181,3 +186,16 @@ async def finish_turn(bot: Bot, db: Database, gm: GameMaster, settings: Settings
             await bot.send_message(chat_id, "📭 Не смог доставить секретные доклады: " + ", ".join(unreachable)
                                    + ". Напишите мне в личку /start.")
         await bot.send_message(chat_id, f"▶️ Начался новый ход: <b>{new_label}</b>. Отдавайте приказы!")
+        for summit in outcome.summits:
+            from bot.handlers.conference import open_conference
+
+            parties = {summit["host"]["id"]: summit["host"], **{g["id"]: g for g in summit["guests"]}}
+            error = await open_conference(bot, db, chat_id, game["turn"] + 1, summit["host"], parties, summit["topic"],
+                                          emergency=True, opening=summit["opening"])
+            if error:
+                names = ", ".join(f"{g['flag']} {escape(g['name'])}" for g in summit["guests"])
+                await bot.send_message(chat_id, f"🚨 <b>{summit['host']['flag']} {escape(summit['host']['name'])} призывает к "
+                                                f"экстренному саммиту:</b> {escape(summit['topic'])}\nПриглашены: {names}\n"
+                                                f"<i>{escape(summit['opening'])}</i>\n\n"
+                                                "Свободной комнаты переговоров нет — админ может добавить её: /addroom, "
+                                                "или созовите встречу сами: /conference")

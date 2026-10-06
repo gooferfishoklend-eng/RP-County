@@ -160,19 +160,48 @@ TURN_SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        "npc_private_messages": {
+            "type": "array",
+            "description": "Тайные личные послания стран-НИП лидерам стран-игроков (предложения, угрозы, сделки)",
+            "items": {
+                "type": "object",
+                "properties": {"from_id": {"type": "integer"}, "to_id": {"type": "integer"}, "text": {"type": "string"}},
+                "required": ["from_id", "to_id", "text"],
+                "additionalProperties": False,
+            },
+        },
+        "summits": {
+            "type": "array",
+            "description": "Экстренный саммит, который созывает страна-НИП (не больше одного за ход, только при серьёзном поводе)",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "initiator_id": {"type": "integer"},
+                    "topic": {"type": "string"},
+                    "invitee_ids": {"type": "array", "items": {"type": "integer"}},
+                    "opening": {"type": "string", "description": "Вступительная речь организатора, 2-4 предложения"},
+                },
+                "required": ["initiator_id", "topic", "invitee_ids", "opening"],
+                "additionalProperties": False,
+            },
+        },
         "npc_messages": {
             "type": "array",
             "description": "Публичные заявления стран-НИП в общем чате",
             "items": {
                 "type": "object",
-                "properties": {"country_id": {"type": "integer"}, "text": {"type": "string"}},
-                "required": ["country_id", "text"],
+                "properties": {
+                    "country_id": {"type": "integer"},
+                    "to_country_id": {"type": "integer", "description": "К кому обращается (id страны), 0 — ко всем"},
+                    "text": {"type": "string"},
+                },
+                "required": ["country_id", "to_country_id", "text"],
                 "additionalProperties": False,
             },
         },
     },
     "required": ["headline", "world_news", "world_event", "countries", "relations", "events", "npc_messages",
-                 "chronicle_summary", "npc_notes", "npc_support"],
+                 "chronicle_summary", "npc_notes", "npc_support", "npc_private_messages", "summits"],
     "additionalProperties": False,
 }
 
@@ -362,9 +391,15 @@ class GameMaster:
             "Случайные события ОТКЛЮЧЕНЫ: не создавай новых (event_id = 0), только развивай существующие."
         )
         rules.append(
-            "npc_messages: 2–5 живых публичных заявлений стран-НИП в чат (реакции на действия игроков и события), "
-            "от имени их МИД или лидеров."
-            if npc_chat else "npc_messages: пустой список (общение НИП в чате отключено)."
+            "npc_messages: 2–6 живых публичных реплик стран-НИП в общий чат: реакции на действия игроков и события, "
+            "а также обращения стран-НИП ДРУГ К ДРУГУ (to_country_id) — споры, предложения, угрозы, поддержка; "
+            "0 — заявление для всех. Пиши от имени их МИД или лидеров. "
+            "npc_private_messages: 0–2 тайных личных послания стран-НИП игрокам, если стране есть что предложить или "
+            "чем пригрозить. summits: если ситуация экстренная (большая война, эпидемия, кризис, угроза союзу) — "
+            "одна страна-НИП может созвать саммит, пригласив затронутых игроков и страны-НИП (2–6 участников); "
+            "иначе пустой список."
+            if npc_chat else
+            "npc_messages, npc_private_messages, summits: пустые списки (общение НИП отключено)."
         )
         prompt = (
             "Просчитай итоги хода. Состояние мира, действия игроков и итоги боёв (JSON):\n\n"
