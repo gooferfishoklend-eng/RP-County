@@ -25,6 +25,16 @@ bash <(curl -fsSL https://raw.githubusercontent.com/gooferfishoklend-eng/RP-Coun
 
 Полезное: `docker logs -f rp-county` · `cd /opt/rp-county && docker compose restart` · настройки в `/opt/rp-county/.env`, база в `/opt/rp-county/data`.
 
+**Обновление без потери прогресса:** просто запустите команду установки ещё раз. База игры лежит в `/opt/rp-county/data` и переживает пересборку; перед каждым обновлением скрипт сохраняет её копию в `/opt/rp-county/backups` (хранятся 10 последних). Если формат базы когда-нибудь изменится, бот не удалит старые данные молча, а сохранит их рядом в файл `geopolitics.db.schema-v…bak`.
+
+Восстановить игру из копии:
+
+```bash
+cd /opt/rp-county && docker compose stop
+cp backups/geopolitics.db.<дата> data/geopolitics.db && chown 10001:10001 data/geopolitics.db
+docker compose start
+```
+
 Без интерактива (например, из Ansible):
 
 ```bash

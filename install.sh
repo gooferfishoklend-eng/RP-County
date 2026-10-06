@@ -88,6 +88,24 @@ fi
 $SUDO mkdir -p "$DIR/data"
 $SUDO chown 10001:10001 "$DIR/data"
 
+if [ -f "$DIR/data/geopolitics.db" ]; then
+  backup_dir="$DIR/backups"
+  $SUDO mkdir -p "$backup_dir"
+  target="$backup_dir/geopolitics.db.$(date +%Y%m%d-%H%M%S)"
+  snap="$DIR/data/.backup-snapshot.db"
+  $SUDO rm -f "$snap"
+  # consistent snapshot through SQLite itself while the bot keeps running; plain copy if it is stopped
+  if $SUDO docker exec rp-county python -c \
+      "import sqlite3; sqlite3.connect('/data/geopolitics.db').execute(\"VACUUM INTO '/data/.backup-snapshot.db'\")" \
+      >/dev/null 2>&1 && [ -f "$snap" ]; then
+    $SUDO mv "$snap" "$target"
+  else
+    $SUDO cp -a "$DIR/data/geopolitics.db" "$target"
+  fi
+  say "Резервная копия базы игры: $target"
+  $SUDO sh -c "ls -1t '$backup_dir'/geopolitics.db.* 2>/dev/null | tail -n +11 | xargs -r rm -f"
+fi
+
 say "Собираю и запускаю контейнер rp-county (первая сборка ~2–4 минуты)…"
 cd "$DIR"
 $COMPOSE up -d --build --remove-orphans
@@ -101,5 +119,5 @@ cat <<EOF
    Перезапуск:  cd $DIR && docker compose restart
    Остановка:   cd $DIR && docker compose down
    Обновление:  запустите эту же команду установки ещё раз
-   Настройки:   $DIR/.env   ·   данные игры: $DIR/data
+   Настройки:   $DIR/.env   ·   данные игры: $DIR/data   ·   бэкапы: $DIR/backups
 EOF

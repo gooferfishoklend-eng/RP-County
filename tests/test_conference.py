@@ -126,3 +126,29 @@ async def test_migrate_chat_moves_game_and_room(db):
     assert await db.migrate_chat(ROOM, new_room)
     assert await db.get_room(ROOM) is None and (await db.get_room(new_room))["game_chat_id"] == new_game
     assert not await db.migrate_chat(CHAT, new_game)
+
+
+async def test_schema_change_keeps_backup(tmp_path):
+    import glob
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE games (chat_id INTEGER PRIMARY KEY, title TEXT)")
+    con.execute("INSERT INTO games VALUES (-5, 'старая игра')")
+    con.execute("PRAGMA user_version = 2")
+    con.commit()
+    con.close()
+
+    database = Database(str(path))
+    await database.connect()
+    assert await database.get_game(-5) is None
+    await database.close()
+    backups = glob.glob(f"{path}.schema-v2-*.bak")
+    assert len(backups) == 1
+    assert sqlite3.connect(backups[0]).execute("SELECT title FROM games").fetchone() == ("старая игра",)
+
+    database = Database(str(path))
+    await database.connect()
+    await database.close()
+    assert len(glob.glob(f"{path}.*.bak")) == 1

@@ -1,9 +1,13 @@
 import json
+import logging
+from datetime import datetime
 
 import aiosqlite
 
 from bot.geo import name_key
 from bot.stats import STAT_KEYS
+
+log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 3
 
@@ -217,12 +221,23 @@ class Database:
         self.conn.row_factory = aiosqlite.Row
         async with self.conn.execute("PRAGMA user_version") as cur:
             version = (await cur.fetchone())[0]
-        if version != SCHEMA_VERSION:
+        async with self.conn.execute("SELECT count(*) FROM sqlite_master WHERE type = 'table'") as cur:
+            has_tables = (await cur.fetchone())[0] > 0
+        if version != SCHEMA_VERSION and has_tables:
+            await self._backup(f"schema-v{version}")
             for table in ALL_TABLES:
                 await self.conn.execute(f"DROP TABLE IF EXISTS {table}")
         await self.conn.executescript(SCHEMA)
         await self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         await self.conn.commit()
+
+    async def _backup(self, label: str) -> None:
+        """Keep a copy of an incompatible database instead of silently wiping it."""
+        if self.path == ":memory:":
+            return
+        target = f"{self.path}.{label}-{datetime.now():%Y%m%d-%H%M%S}.bak"
+        await self.conn.execute("VACUUM INTO ?", (target,))
+        log.warning("database schema changed, old data saved to %s", target)
 
     async def close(self) -> None:
         if self.conn:
