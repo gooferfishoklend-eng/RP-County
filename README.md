@@ -13,7 +13,26 @@
 - **События.** ИИ придумывает эпидемии, катастрофы и кризисы, которые длятся несколько ходов и распространяются. Страны могут помогать друг другу (`/aid`), вводить карантин реформами и голосовать в ООН. Админ может запустить своё событие: `/event`. Случайные события тоже отключаются в `/settings`.
 - **Тайные действия** в личке (`/secret`), ИИ-советник, 9 показателей страны, рейтинг держав, падение правительства при обвале стабильности.
 
-## Запуск
+## Установка на сервер одной командой (Docker)
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/gooferfishoklend-eng/RP-County/HEAD/install.sh)
+```
+
+Скрипт скачает бота в `/opt/rp-county`, спросит токен бота и ключ ИИ (Claude API или OpenRouter), соберёт образ и запустит контейнер `rp-county`. Повторный запуск той же команды — обновление (настройки и данные игры сохраняются).
+
+**Совместимость с remnanode:** бот работает через long polling и не открывает ни одного порта, живёт в своём compose-проекте, своей сети и каталоге, ограничен 768 МБ RAM и 1 CPU с пониженным приоритетом, логи ротируются (до 30 МБ). Скрипт не трогает другие контейнеры и не делает `docker prune`.
+
+Полезное: `docker logs -f rp-county` · `cd /opt/rp-county && docker compose restart` · настройки в `/opt/rp-county/.env`, база в `/opt/rp-county/data`.
+
+Без интерактива (например, из Ansible):
+
+```bash
+BOT_TOKEN=... AI_PROVIDER=anthropic ANTHROPIC_API_KEY=... \
+  bash <(curl -fsSL https://raw.githubusercontent.com/gooferfishoklend-eng/RP-County/HEAD/install.sh)
+```
+
+## Запуск без Docker
 
 1. Создайте бота у [@BotFather](https://t.me/BotFather) и получите токен.
 2. Получите ключ Claude API в [Anthropic Console](https://console.anthropic.com/).

@@ -1,0 +1,24 @@
+# The bot uses Telegram long polling: it opens no ports, so it cannot clash with
+# remnanode (host network, ports 443/2222/...). Its own project name, container,
+# network and data dir keep it fully separate; CPU/RAM caps keep the VPN first.
+name: rp-county
+
+services:
+  bot:
+    build: .
+    image: rp-county:latest
+    container_name: rp-county
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /data/geopolitics.db
+    volumes:
+      - ./data:/data
+    mem_limit: 768m
+    cpus: 1.0
+    cpu_shares: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
