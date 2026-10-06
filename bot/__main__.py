@@ -10,6 +10,7 @@ from bot.ai import GameMaster
 from bot.config import load_settings
 from bot.db import Database
 from bot.geo import load_world
+from bot.llm import make_backend
 from bot.handlers import setup_routers
 
 COMMANDS = [
@@ -25,6 +26,8 @@ COMMANDS = [
     BotCommand(command="say", description="Обратиться к стране"),
     BotCommand(command="propose", description="Предложить договор"),
     BotCommand(command="peace", description="Мирный договор"),
+    BotCommand(command="conference", description="Созвать мирную конференцию"),
+    BotCommand(command="draft", description="Составить договор (в зале конференции)"),
     BotCommand(command="transfer", description="Передать провинции"),
     BotCommand(command="demand", description="Потребовать провинции"),
     BotCommand(command="aid", description="Помощь стране"),
@@ -52,7 +55,10 @@ async def main() -> None:
 
     db = Database(settings.db_path)
     await db.connect()
-    gm = GameMaster(settings.ai_model, settings.anthropic_api_key)
+    backend = make_backend(settings.ai_provider.lower(), settings.ai_model, settings.anthropic_api_key,
+                           settings.openrouter_api_key)
+    gm = GameMaster(backend)
+    logging.info("AI provider: %s, model: %s", settings.ai_provider, settings.ai_model)
 
     bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(db=db, gm=gm, settings=settings)
@@ -60,7 +66,7 @@ async def main() -> None:
 
     await bot.set_my_commands(COMMANDS)
     try:
-        await dp.start_polling(bot)
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await db.close()
         await bot.session.close()

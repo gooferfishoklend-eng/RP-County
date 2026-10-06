@@ -5,7 +5,7 @@ import aiosqlite
 from bot.geo import name_key
 from bot.stats import STAT_KEYS
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS games (
@@ -144,14 +144,54 @@ CREATE TABLE IF NOT EXISTS events (
     updated_turn  INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS rooms (
+    room_chat_id   INTEGER PRIMARY KEY,
+    game_chat_id   INTEGER NOT NULL,
+    title          TEXT,
+    conference_id  INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS conferences (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id        INTEGER NOT NULL,
+    room_chat_id   INTEGER NOT NULL,
+    topic          TEXT NOT NULL,
+    initiator_id   INTEGER NOT NULL,
+    invite_link    TEXT,
+    status         TEXT NOT NULL DEFAULT 'open',
+    draft          TEXT,
+    draft_version  INTEGER NOT NULL DEFAULT 0,
+    turn           INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS conference_members (
+    conference_id  INTEGER NOT NULL,
+    country_id     INTEGER NOT NULL,
+    user_id        INTEGER,
+    joined         INTEGER NOT NULL DEFAULT 0,
+    signed         INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (conference_id, country_id)
+);
+
+CREATE TABLE IF NOT EXISTS conference_log (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    conference_id  INTEGER NOT NULL,
+    message_id     INTEGER NOT NULL,
+    kind           TEXT NOT NULL,
+    country_id     INTEGER,
+    speaker        TEXT NOT NULL,
+    text           TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS user_prefs (
     user_id         INTEGER PRIMARY KEY,
     active_chat_id  INTEGER
 );
 """
 
-GAME_TABLES = ("countries", "cells", "actions", "relations", "treaties", "resolutions", "chronicle", "generals", "events")
-ALL_TABLES = ("games", *GAME_TABLES, "votes", "user_prefs", "proposals")
+GAME_TABLES = ("countries", "cells", "actions", "relations", "treaties", "resolutions", "chronicle", "generals", "events",
+               "conferences")
+ALL_TABLES = ("games", *GAME_TABLES, "votes", "user_prefs", "proposals", "rooms", "conference_members", "conference_log")
 
 COUNTRY_COLS = ["chat_id", "code", "user_id", "player_name", "name", "name_key", "flag", "government", "leader_title",
                 "description", *STAT_KEYS, "capital_cell"]
@@ -453,6 +493,91 @@ class Database:
     async def active_events(self, chat_id: int) -> list[dict]:
         rows = await self._all("SELECT * FROM events WHERE chat_id = ? AND status = 'active' ORDER BY id", (chat_id,))
         return [_event_row(r) for r in rows]
+
+    async def signed_agreements(self, chat_id: int, limit: int = 8) -> list[dict]:
+        treaties = await self._all(
+            "SELECT * FROM treaties WHERE chat_id = ? AND status = 'signed' ORDER BY id DESC LIMIT ?", (chat_id, limit)
+        )
+        confs = await self._all(
+            "SELECT * FROM conferences WHERE chat_id = ? AND status = 'signed' ORDER BY id DESC LIMIT ?", (chat_id, limit)
+        )
+        out = [{"kind": t["kind"], "parties": [t["a_id"], t["b_id"]], "text": t["text"], "turn": t["turn"]} for t in treaties]
+        for c in confs:
+            terms = json.loads(c["draft"] or "{}")
+            members = await self.conference_members(c["id"])
+            out.append({"kind": "conference", "parties": [m["country_id"] for m in members], "turn": c["turn"],
+                        "title": terms.get("title"), "text": terms.get("summary"), "clauses": terms.get("clauses", [])})
+        return sorted(out, key=lambda x: -x["turn"])[:limit]
+
+    # conference rooms
+    async def add_room(self, room_chat_id: int, game_chat_id: int, title: str) -> None:
+        await self._exec(
+            "INSERT OR REPLACE INTO rooms (room_chat_id, game_chat_id, title, conference_id) VALUES (?, ?, ?, NULL)",
+            (room_chat_id, game_chat_id, title),
+        )
+
+    async def get_room(self, room_chat_id: int) -> dict | None:
+        return await self._one("SELECT * FROM rooms WHERE room_chat_id = ?", (room_chat_id,))
+
+    async def list_rooms(self, game_chat_id: int) -> list[dict]:
+        return await self._all("SELECT * FROM rooms WHERE game_chat_id = ?", (game_chat_id,))
+
+    async def set_room_conference(self, room_chat_id: int, conference_id: int | None) -> None:
+        await self._exec("UPDATE rooms SET conference_id = ? WHERE room_chat_id = ?", (conference_id, room_chat_id))
+
+    # conferences
+    async def create_conference(self, chat_id: int, room_chat_id: int, topic: str, initiator_id: int, turn: int,
+                                members: list[tuple[int, int | None]]) -> int:
+        cid = await self._exec(
+            "INSERT INTO conferences (chat_id, room_chat_id, topic, initiator_id, turn) VALUES (?, ?, ?, ?, ?)",
+            (chat_id, room_chat_id, topic, initiator_id, turn),
+        )
+        await self.conn.executemany(
+            "INSERT INTO conference_members (conference_id, country_id, user_id, joined) VALUES (?, ?, ?, ?)",
+            [(cid, country_id, user_id, 0 if user_id else 1) for country_id, user_id in members],
+        )
+        await self.conn.commit()
+        return cid
+
+    async def get_conference(self, conference_id: int) -> dict | None:
+        row = await self._one("SELECT * FROM conferences WHERE id = ?", (conference_id,))
+        if row:
+            row["draft"] = json.loads(row["draft"]) if row["draft"] else None
+        return row
+
+    async def open_conferences(self, chat_id: int) -> list[dict]:
+        return await self._all("SELECT * FROM conferences WHERE chat_id = ? AND status = 'open'", (chat_id,))
+
+    async def update_conference(self, conference_id: int, **fields) -> None:
+        allowed = {"invite_link", "status", "draft", "draft_version"}
+        keys = [k for k in fields if k in allowed]
+        values = [json.dumps(fields[k], ensure_ascii=False) if k == "draft" else fields[k] for k in keys]
+        await self._exec(f"UPDATE conferences SET {', '.join(f'{k} = ?' for k in keys)} WHERE id = ?",
+                         (*values, conference_id))
+
+    async def conference_members(self, conference_id: int) -> list[dict]:
+        return await self._all("SELECT * FROM conference_members WHERE conference_id = ? ORDER BY country_id",
+                               (conference_id,))
+
+    async def set_member(self, conference_id: int, country_id: int, **fields) -> None:
+        keys = [k for k in fields if k in ("joined", "signed")]
+        await self._exec(
+            f"UPDATE conference_members SET {', '.join(f'{k} = ?' for k in keys)} WHERE conference_id = ? AND country_id = ?",
+            (*(fields[k] for k in keys), conference_id, country_id),
+        )
+
+    async def reset_signatures(self, conference_id: int) -> None:
+        await self._exec("UPDATE conference_members SET signed = 0 WHERE conference_id = ?", (conference_id,))
+
+    async def log_conference(self, conference_id: int, message_id: int, kind: str, country_id: int | None,
+                             speaker: str, text: str) -> None:
+        await self._exec(
+            "INSERT INTO conference_log (conference_id, message_id, kind, country_id, speaker, text) VALUES (?, ?, ?, ?, ?, ?)",
+            (conference_id, message_id, kind, country_id, speaker, text),
+        )
+
+    async def conference_log(self, conference_id: int) -> list[dict]:
+        return await self._all("SELECT * FROM conference_log WHERE conference_id = ? ORDER BY id", (conference_id,))
 
     # user prefs
     async def set_active_chat(self, user_id: int, chat_id: int) -> None:

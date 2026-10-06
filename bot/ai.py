@@ -1,13 +1,12 @@
 import json
 import logging
 
-import anthropic
-
+from bot.llm import AIError, extract_json
 from bot.stats import STAT_KEYS
 
-log = logging.getLogger(__name__)
+__all__ = ["AIError", "GameMaster"]
 
-FALLBACK_BETA = "server-side-fallback-2026-07-01"
+log = logging.getLogger(__name__)
 
 GM_SYSTEM = """Ты — ведущий (гейм-мастер) текстовой ролевой геополитической игры в Telegram-группе.
 Игроки управляют реальными современными странами. Остальными странами (НИП) управляешь ты. Мир — наш реальный мир на момент начала игры, дальше он развивается по решениям игроков.
@@ -23,6 +22,7 @@ GM_SYSTEM = """Ты — ведущий (гейм-мастер) текстово�
 - Карта мира разбита на провинции. Территориальные изменения и военные потери от боёв уже посчитаны движком игры (war_results) — не дублируй их, а добавляй экономические и социальные последствия войны, реакцию мира, беженцев, санкции.
 - Действия разных игроков взаимодействуют: санкции бьют по экономике цели, договоры улучшают отношения, помощь (aid) при бедствиях повышает влияние помогающего и смягчает удар.
 - Страны-НИП живут своей жизнью и реагируют на происходящее.
+- Подписанные договоры (agreements_in_force) обязательны: их условия (торговля, демилитаризация, гарантии, выплаты и т.д.) реально действуют. Нарушение договора — международный скандал, падение влияния и доверия.
 - При очень низкой стабильности — протесты, забастовки, угроза переворота.
 - Мировые события (эпидемии, катастрофы, кризисы) длятся несколько ходов: распространяются на соседей, усиливаются или затухают. Карантин, медицина, технологии и международная помощь помогают с ними справиться.
 
@@ -213,58 +213,24 @@ NPC_SCHEMA = {
 }
 
 
-class AIError(Exception):
-    pass
-
-
 def _dump(data) -> str:
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
 class GameMaster:
-    def __init__(self, model: str, api_key: str | None = None):
-        self.client = anthropic.AsyncAnthropic(api_key=api_key) if api_key else anthropic.AsyncAnthropic()
-        self.model = model
+    def __init__(self, backend):
+        self.backend = backend
 
     async def _call(self, system: str, user: str, *, effort: str, max_tokens: int, schema: dict | None = None) -> str:
-        output_config: dict = {"effort": effort}
-        if schema:
-            output_config["format"] = {"type": "json_schema", "schema": schema}
-        try:
-            async with self.client.beta.messages.stream(
-                model=self.model,
-                max_tokens=max_tokens,
-                betas=[FALLBACK_BETA],
-                fallbacks="default",
-                system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-                output_config=output_config,
-                messages=[{"role": "user", "content": user}],
-            ) as stream:
-                response = await stream.get_final_message()
-        except anthropic.RateLimitError as e:
-            raise AIError("ИИ-ведущий перегружен, попробуйте через минуту.") from e
-        except anthropic.APIStatusError as e:
-            log.exception("Claude API error %s", e.status_code)
-            raise AIError(f"Ошибка ИИ ({e.status_code}). Попробуйте позже.") from e
-        except anthropic.APIConnectionError as e:
-            raise AIError("Нет связи с ИИ. Попробуйте позже.") from e
-
-        if response.stop_reason == "refusal":
-            raise AIError("ИИ отказался обрабатывать этот запрос. Переформулируйте действие.")
-        if response.stop_reason == "max_tokens":
-            raise AIError("Ответ ИИ оказался слишком длинным. Попробуйте ещё раз.")
-
-        blocks = list(response.content)
-        last_fallback = max((i for i, b in enumerate(blocks) if b.type == "fallback"), default=-1)
-        text = "".join(b.text for b in blocks[last_fallback + 1 :] if b.type == "text")
-        if not text:
+        text = await self.backend.complete(system, user, effort=effort, max_tokens=max_tokens, schema=schema)
+        if not text.strip():
             raise AIError("ИИ вернул пустой ответ.")
         return text
 
     async def _call_json(self, system: str, user: str, schema: dict, *, effort: str, max_tokens: int) -> dict:
         text = await self._call(system, user, effort=effort, max_tokens=max_tokens, schema=schema)
         try:
-            return json.loads(text)
+            return extract_json(text)
         except json.JSONDecodeError as e:
             raise AIError("ИИ вернул некорректные данные. Попробуйте ещё раз.") from e
 
@@ -350,3 +316,101 @@ class GameMaster:
             f"Состояние мира (JSON):\n{_dump(world)}\n\nОбращение: {text}"
         )
         return await self._call(GM_SYSTEM, prompt, effort="low", max_tokens=2000)
+
+    async def conference_draft(self, context: dict) -> dict:
+        prompt = (
+            "Ты — секретариат международной конференции. Внимательно проанализируй стенограмму переговоров и составь "
+            "проект итогового договора: только то, о чём стороны реально договорились (или к чему явно пришли). "
+            "Не выдумывай уступок, которых не было. Спорное вынеси в unresolved.\n"
+            "- peace: прекращение войн между участниками (mode front — по линии фронта, status_quo — возврат земель).\n"
+            "- province_transfers: передачи провинций, ТОЛЬКО cell_id из списка provinces, from_id — текущий владелец.\n"
+            "- payments: денежные выплаты (млрд $): репарации, кредиты, помощь, покупка территорий.\n"
+            "- alliances, relation_changes: союзы и потепление/охлаждение отношений.\n"
+            "- clauses: всё остальное, о чём договорились (демилитаризация, торговля, базы, гарантии, обмен пленными, "
+            "технологии, ресурсы и т.д.) — чётко, по пунктам; ведущий учтёт их в следующих ходах.\n"
+            "- npc_positions: для каждой страны-участника под управлением ИИ (player=false) реши, подпишет ли она этот "
+            "проект, исходя из её интересов и хода переговоров, и коротко объясни.\n"
+            "- ready_to_sign: true, если стороны пришли к согласию по главным вопросам.\n\n"
+            + _dump(context)
+        )
+        return await self._call_json(GM_SYSTEM, prompt, CONFERENCE_SCHEMA, effort="medium", max_tokens=16000)
+
+    async def conference_npc_reply(self, npc: dict, context: dict) -> str:
+        prompt = (
+            f"Ты — глава делегации страны «{npc['name']}» (её интересами управляешь ты) на международной конференции. "
+            "К тебе обратились в стенограмме ниже. Ответь от первого лица как дипломат этой страны: по существу, "
+            "отстаивая её интересы, можно торговаться и выдвигать условия. 1–4 предложения, без подписи.\n\n"
+            + _dump(context)
+        )
+        return await self._call(GM_SYSTEM, prompt, effort="low", max_tokens=2000)
+
+
+PAIR = {
+    "type": "object",
+    "properties": {"a_id": {"type": "integer"}, "b_id": {"type": "integer"}},
+    "required": ["a_id", "b_id"],
+    "additionalProperties": False,
+}
+
+CONFERENCE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string", "description": "Название договора, например «Женевский мирный договор»"},
+        "summary": {"type": "string", "description": "Суть договорённостей, 2-5 предложений"},
+        "peace": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"a_id": {"type": "integer"}, "b_id": {"type": "integer"},
+                               "mode": {"type": "string", "enum": ["front", "status_quo"]}},
+                "required": ["a_id", "b_id", "mode"],
+                "additionalProperties": False,
+            },
+        },
+        "province_transfers": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"cell_id": {"type": "integer"}, "from_id": {"type": "integer"}, "to_id": {"type": "integer"}},
+                "required": ["cell_id", "from_id", "to_id"],
+                "additionalProperties": False,
+            },
+        },
+        "payments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"from_id": {"type": "integer"}, "to_id": {"type": "integer"},
+                               "amount_bn": {"type": "number"}, "purpose": {"type": "string"}},
+                "required": ["from_id", "to_id", "amount_bn", "purpose"],
+                "additionalProperties": False,
+            },
+        },
+        "alliances": {"type": "array", "items": PAIR},
+        "relation_changes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"a_id": {"type": "integer"}, "b_id": {"type": "integer"}, "delta": {"type": "integer"}},
+                "required": ["a_id", "b_id", "delta"],
+                "additionalProperties": False,
+            },
+        },
+        "clauses": {"type": "array", "items": {"type": "string"}},
+        "unresolved": {"type": "array", "items": {"type": "string"}},
+        "npc_positions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"country_id": {"type": "integer"}, "accepts": {"type": "boolean"},
+                               "statement": {"type": "string"}},
+                "required": ["country_id", "accepts", "statement"],
+                "additionalProperties": False,
+            },
+        },
+        "ready_to_sign": {"type": "boolean"},
+    },
+    "required": ["title", "summary", "peace", "province_transfers", "payments", "alliances", "relation_changes",
+                 "clauses", "unresolved", "npc_positions", "ready_to_sign"],
+    "additionalProperties": False,
+}

@@ -132,6 +132,10 @@ async def world_snapshot(db: Database, chat_id: int, extra_ids: set[int] | None 
         if r["a_id"] in by_id and r["b_id"] in by_id and (r["a_id"] in relevant or r["b_id"] in relevant)
     ]
     history = [{"turn": h["turn"], "headline": h["headline"], "event": h["event"]} for h in await db.recent_chronicle(chat_id)]
+    agreements = [
+        {**a, "parties": [by_id[pid]["name"] for pid in a["parties"] if pid in by_id]}
+        for a in await db.signed_agreements(chat_id)
+    ]
     return {
         "turn": game["turn"] if game else 1,
         "countries": out_countries,
@@ -144,6 +148,7 @@ async def world_snapshot(db: Database, chat_id: int, extra_ids: set[int] | None 
             for e in events
         ],
         "recent_history": history,
+        "agreements_in_force": agreements,
     }
 
 
