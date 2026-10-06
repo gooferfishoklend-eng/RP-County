@@ -8,8 +8,8 @@ from aiogram.types import Message
 from bot.ai import GameMaster
 from bot.config import Settings
 from bot.db import Database
-from bot.game import ACTION_KINDS
-from bot.handlers.common import finish_turn, is_private, player_context, send_dm
+from bot.game import ACTION_KINDS, declare_war
+from bot.handlers.common import find_country, finish_turn, is_private, player_context, send_dm
 
 router = Router()
 
@@ -19,19 +19,19 @@ PUBLIC_TEMPLATES = {
     "reform": "🏛 {flag} <b>{name}</b> объявляет реформу:\n{text}",
     "foreign": "🌐 {flag} <b>{name}</b> — внешнеполитическое заявление:\n{text}",
     "sanction": "🚫 {flag} <b>{name}</b> вводит санкции против <b>{target}</b>:\n{text}",
-    "war": "⚔️ {flag} <b>{name}</b> ОБЪЯВЛЯЕТ ВОЙНУ стране <b>{target}</b>!\nЦель: {text}",
+    "aid": "🤲 {flag} <b>{name}</b> направляет помощь стране <b>{target}</b>:\n{text}",
+    "war": "⚔️ {flag} <b>{name}</b> — приказ армии на войне с <b>{target}</b>:\n{text}",
 }
 
 
-def parse_target(args: str | None) -> tuple[str, str]:
-    target, _, text = (args or "").partition("|")
-    return target.strip(), text.strip()
+def parse_parts(args: str | None, n: int = 2) -> list[str]:
+    parts = [p.strip() for p in (args or "").split("|", n - 1)]
+    return parts + [""] * (n - len(parts))
 
 
-async def add_action(
-    message: Message, bot: Bot, db: Database, settings: Settings, kind: str, text: str, target: str | None = None
-) -> dict | None:
-    ctx = await player_context(message, db)
+async def add_action(message: Message, bot: Bot, db: Database, settings: Settings, kind: str, text: str,
+                     target: str | None = None, ctx: tuple[dict, dict] | None = None) -> dict | None:
+    ctx = ctx or await player_context(message, db)
     if not ctx:
         return None
     game, country = ctx
@@ -41,18 +41,17 @@ async def add_action(
     if len(text) > MAX_TEXT:
         await message.answer(f"Слишком длинно — максимум {MAX_TEXT} символов.")
         return None
-    done = await db.list_actions(game["chat_id"], game["turn"], country["id"])
+    done = [a for a in await db.list_actions(game["chat_id"], game["turn"], country["id"]) if a["kind"] in PUBLIC_TEMPLATES or a["kind"] == "secret"]
     if len(done) >= settings.max_actions_per_turn:
         await message.answer(f"Лимит приказов на ход — {settings.max_actions_per_turn}. Отмените лишнее через /undo или жмите /ready.")
         return None
 
     await db.add_action(game["chat_id"], game["turn"], country["id"], kind, text, target)
+    counter = f"{len(done) + 1}/{settings.max_actions_per_turn}"
 
     if kind == "secret":
-        await message.answer(
-            f"🕶 Тайный приказ принят ({len(done) + 1}/{settings.max_actions_per_turn}). "
-            "Об исполнении доложат в конце хода. Помните: чем масштабнее операция, тем выше риск утечки."
-        )
+        await message.answer(f"🕶 Тайный приказ принят ({counter}). Об исполнении доложат в конце хода. "
+                             "Помните: чем масштабнее операция, тем выше риск утечки.")
         return country
 
     announcement = PUBLIC_TEMPLATES[kind].format(
@@ -60,9 +59,9 @@ async def add_action(
     )
     if is_private(message):
         await bot.send_message(game["chat_id"], announcement)
-        await message.answer(f"✅ Приказ принят и объявлен в группе ({len(done) + 1}/{settings.max_actions_per_turn}).")
+        await message.answer(f"✅ Приказ принят и объявлен в группе ({counter}).")
     else:
-        await message.answer(announcement + f"\n\n<i>Приказ {len(done) + 1}/{settings.max_actions_per_turn}</i>")
+        await message.answer(announcement + f"\n\n<i>Приказ {counter}</i>")
     return country
 
 
@@ -84,38 +83,68 @@ async def cmd_secret(message: Message, command: CommandObject, bot: Bot, db: Dat
         except TelegramBadRequest:
             pass
         me = await bot.me()
-        await message.answer(
-            f"🤫 Тайные приказы отдаются только в личке: @{me.username}. "
-            "Если бот админ группы, ваше сообщение уже удалено; если нет — удалите его сами."
-        )
+        await message.answer(f"🤫 Тайные приказы отдаются только в личке: @{me.username}. "
+                             "Если бот админ группы, ваше сообщение уже удалено; если нет — удалите его сами.")
         return
     await add_action(message, bot, db, settings, "secret", (command.args or "").strip())
 
 
-async def _hostile(message: Message, command: CommandObject, bot: Bot, db: Database, settings: Settings, kind: str):
-    target, text = parse_target(command.args)
+async def _targeted(message: Message, command: CommandObject, bot: Bot, db: Database, settings: Settings, kind: str,
+                    hint: str) -> tuple[dict, dict, dict] | None:
+    ctx = await player_context(message, db)
+    if not ctx:
+        return None
+    game, me = ctx
+    target_name, text = parse_parts(command.args)
+    if not target_name:
+        await message.answer(f"Формат: /{kind} <i>страна</i> | <i>{hint}</i>")
+        return None
+    target = await find_country(db, game["chat_id"], target_name)
     if not target:
-        await message.answer(f"Формат: /{kind} <i>страна</i> | <i>{'цель' if kind == 'war' else 'причина'}</i>")
-        return
-    country = await add_action(message, bot, db, settings, kind, text or "без объяснения причин", target)
-    if not country:
-        return
-    other = await db.get_country_by_name(country["chat_id"], target)
-    if other and other["id"] != country["id"]:
-        if kind == "war":
-            await db.change_relation(country["chat_id"], country["id"], other["id"], -40, "war")
-        else:
-            await db.change_relation(country["chat_id"], country["id"], other["id"], -15, "tension")
+        await message.answer(f"Не нашёл страну «{escape(target_name)}».")
+        return None
+    if target["id"] == me["id"]:
+        await message.answer("Это ваша собственная страна.")
+        return None
+    country = await add_action(message, bot, db, settings, kind, text or hint, target["name"], ctx)
+    return (game, country, target) if country else None
 
 
 @router.message(Command("war"))
-async def cmd_war(message: Message, command: CommandObject, bot: Bot, db: Database, settings: Settings):
-    await _hostile(message, command, bot, db, settings, "war")
+async def cmd_war(message: Message, command: CommandObject, bot: Bot, db: Database, gm: GameMaster, settings: Settings):
+    res = await _targeted(message, command, bot, db, settings, "war", "цель войны / приказ армии")
+    if not res:
+        return
+    game, me, target = res
+    rel = await db.get_relation(game["chat_id"], me["id"], target["id"])
+    if rel["status"] == "war":
+        return
+    created = await declare_war(db, gm, game["chat_id"], me, target)
+    lines = [f"💥 <b>{me['flag']} {escape(me['name'])} ОБЪЯВЛЯЕТ ВОЙНУ {target['flag']} {escape(target['name'])}!</b>",
+             "Армии выдвигаются к границе. Бои начнутся в конце хода."]
+    for g in created:
+        side = me if g["country_id"] == me["id"] else target
+        lines.append(f"🎖 {side['flag']} Командование фронтом: {escape(g['rank'])} {escape(g['name'])} "
+                     f"({escape(g['trait'])}, навык {g['skill']}/10)")
+    lines.append("\nКомандуйте генералами: /generals, /command · Карта фронта: /map " + escape(target["name"]))
+    await bot.send_message(game["chat_id"], "\n".join(lines))
 
 
 @router.message(Command("sanction"))
 async def cmd_sanction(message: Message, command: CommandObject, bot: Bot, db: Database, settings: Settings):
-    await _hostile(message, command, bot, db, settings, "sanction")
+    res = await _targeted(message, command, bot, db, settings, "sanction", "причина")
+    if res:
+        game, me, target = res
+        if (await db.get_relation(game["chat_id"], me["id"], target["id"]))["status"] != "war":
+            await db.change_relation(game["chat_id"], me["id"], target["id"], -15, "tension")
+
+
+@router.message(Command("aid"))
+async def cmd_aid(message: Message, command: CommandObject, bot: Bot, db: Database, settings: Settings):
+    res = await _targeted(message, command, bot, db, settings, "aid", "какая помощь: врачи, вакцины, деньги, спасатели")
+    if res:
+        game, me, target = res
+        await db.change_relation(game["chat_id"], me["id"], target["id"], 5)
 
 
 @router.message(Command("actions"))
@@ -165,11 +194,10 @@ async def cmd_ready(message: Message, bot: Bot, db: Database, gm: GameMaster, se
     game, country = ctx
     chat_id = game["chat_id"]
     await db.set_ready(country["id"], game["turn"])
-    countries = await db.list_countries(chat_id)
-    ready = sum(1 for c in countries if c["ready_turn"] == game["turn"])
-    text = f"✅ {country['flag']} {escape(country['name'])} завершает ход ({ready}/{len(countries)})."
-    await bot.send_message(chat_id, text)
+    players = await db.list_players(chat_id)
+    ready = sum(1 for c in players if c["ready_turn"] == game["turn"])
+    await bot.send_message(chat_id, f"✅ {country['flag']} {escape(country['name'])} завершает ход ({ready}/{len(players)}).")
     if is_private(message):
         await message.answer("Ход завершён. Ждём остальных лидеров.")
-    if ready >= len(countries):
+    if ready >= len(players):
         await finish_turn(bot, db, gm, settings, chat_id)

@@ -1,19 +1,24 @@
+import asyncio
 import logging
 from html import escape
 
 from aiogram import Bot
 from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.types import Message
+from aiogram.types import BufferedInputFile, Message
 
 from bot.ai import AIError, GameMaster
 from bot.config import Settings
 from bot.db import Database
-from bot.game import chat_lock, resolve_turn
+from bot.game import chat_lock, map_view, resolve_turn
+from bot.geo import load_world
+from bot.mapdraw import render_map
 from bot.stats import turn_label
 from bot.texts import ranking, split_message, stat_changes
 
 log = logging.getLogger(__name__)
+
+_render_lock = asyncio.Lock()
 
 
 def is_private(message: Message) -> bool:
@@ -25,17 +30,19 @@ async def is_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
     return member.status in (ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR)
 
 
+async def game_chat_id(message: Message, db: Database) -> int | None:
+    if is_private(message):
+        return await db.get_active_chat(message.from_user.id)
+    return message.chat.id
+
+
 async def player_context(message: Message, db: Database) -> tuple[dict, dict] | None:
     """Find the active game and the sender's country, replying with a hint if missing."""
     user_id = message.from_user.id
-    if is_private(message):
-        chat_id = await db.get_active_chat(user_id)
-        if chat_id is None:
-            await message.answer("Вы ещё не играете. Возьмите страну в группе командой /take, затем выберите игру через /play.")
-            return None
-    else:
-        chat_id = message.chat.id
-
+    chat_id = await game_chat_id(message, db)
+    if chat_id is None:
+        await message.answer("Вы ещё не играете. Возьмите страну в группе командой /take, затем выберите игру через /play.")
+        return None
     game = await db.get_game(chat_id)
     if not game or game["status"] != "active":
         await message.answer("В этой группе нет активной игры. Админ может начать её командой /newgame.")
@@ -45,6 +52,14 @@ async def player_context(message: Message, db: Database) -> tuple[dict, dict] | 
         await message.answer("У вас нет страны в этой игре. Возьмите её командой /take <i>название</i>.")
         return None
     return game, country
+
+
+async def find_country(db: Database, chat_id: int, name: str) -> dict | None:
+    code = load_world().find_country(name)
+    if not code:
+        return None
+    country = await db.get_country_by_code(chat_id, code)
+    return country if country and country["alive"] else None
 
 
 async def send_dm(bot: Bot, user_id: int, text: str) -> bool:
@@ -61,6 +76,18 @@ async def send_long(bot: Bot, chat_id: int, text: str) -> None:
         await bot.send_message(chat_id, part)
 
 
+async def render_png(db: Database, chat_id: int, title: str, focus: int | None = None, mode: str = "political") -> bytes:
+    view = await map_view(db, chat_id, title)
+    async with _render_lock:
+        return await asyncio.to_thread(render_map, load_world(), view, focus, mode)
+
+
+async def send_map(bot: Bot, db: Database, target_chat: int, game_chat: int, title: str, caption: str = "",
+                   focus: int | None = None, mode: str = "political") -> None:
+    png = await render_png(db, game_chat, title, focus, mode)
+    await bot.send_photo(target_chat, BufferedInputFile(png, filename="map.png"), caption=caption[:1000] or None)
+
+
 async def finish_turn(bot: Bot, db: Database, gm: GameMaster, settings: Settings, chat_id: int) -> None:
     lock = chat_lock(chat_id)
     if lock.locked():
@@ -70,7 +97,7 @@ async def finish_turn(bot: Bot, db: Database, gm: GameMaster, settings: Settings
         if not game or game["status"] != "active":
             return
         label = turn_label(game["turn"], settings.start_year)
-        status = await bot.send_message(chat_id, f"⏳ Ведущий подводит итоги: <b>{label}</b>…")
+        status = await bot.send_message(chat_id, f"⏳ Генералы планируют операции, ведущий подводит итоги: <b>{label}</b>…")
         try:
             outcome = await resolve_turn(db, gm, chat_id)
         except AIError as e:
@@ -81,27 +108,38 @@ async def finish_turn(bot: Bot, db: Database, gm: GameMaster, settings: Settings
             await status.edit_text("⚠️ Внутренняя ошибка при подсчёте хода. Попробуйте /endturn ещё раз.")
             return
 
-        parts = [
-            f"📰 <b>Итоги: {label}</b>",
-            f"<b>{escape(outcome.headline)}</b>",
-            "",
-            escape(outcome.world_news),
-            "",
-            f"🌐 <b>Мировое событие:</b> {escape(outcome.world_event)}",
-            "",
-            "<b>Страны:</b>",
-            *(f"• {escape(line)}" for line in outcome.public_lines),
-        ]
+        parts = [f"📰 <b>Итоги: {label}</b>", f"<b>{escape(outcome.headline)}</b>", "", escape(outcome.world_news)]
+        if outcome.world_event:
+            parts += ["", f"🌐 <b>Главное событие:</b> {escape(outcome.world_event)}"]
+        if outcome.war_lines:
+            parts += ["", "<b>⚔️ Сводка с фронтов:</b>", *(f"• {escape(x)}" for x in outcome.war_lines)]
+        if outcome.event_lines:
+            parts += ["", "<b>🌍 Мировые события:</b>", *(f"• {escape(x)}" for x in outcome.event_lines)]
+        if outcome.public_lines:
+            parts += ["", "<b>Страны игроков:</b>", *(f"• {escape(x)}" for x in outcome.public_lines)]
         for name in outcome.collapses:
             parts.append(f"\n🔥 <b>{escape(name)}: правительство пало!</b> Массовые протесты привели к смене власти.")
+        for c in outcome.eliminated:
+            parts.append(f"\n🏳️ <b>{escape(c['name'])} разгромлена и прекратила существование.</b>")
         await status.delete()
         await send_long(bot, chat_id, "\n".join(parts))
 
-        countries = await db.list_countries(chat_id)
-        await send_long(bot, chat_id, ranking(countries))
+        if outcome.npc_messages:
+            voices = ["💬 <b>Голоса мира</b>", ""]
+            voices += [f"{c['flag']} <b>{escape(c['name'])}:</b> {escape(text)}" for c, text in outcome.npc_messages]
+            await send_long(bot, chat_id, "\n".join(voices))
+
+        new_label = turn_label(game["turn"] + 1, settings.start_year)
+        try:
+            await send_map(bot, db, chat_id, chat_id, f"Мир: {new_label}", caption="🗺 Карта мира после хода. Подробнее: /map <i>страна</i>")
+        except Exception:
+            log.exception("map render failed")
+
+        players = await db.list_players(chat_id)
+        await send_long(bot, chat_id, ranking(players))
 
         unreachable = []
-        for c in countries:
+        for c in players:
             report = outcome.private_reports.get(c["id"])
             if report is None:
                 continue
@@ -111,11 +149,10 @@ async def finish_turn(bot: Bot, db: Database, gm: GameMaster, settings: Settings
             )
             if not await send_dm(bot, c["user_id"], text):
                 unreachable.append(escape(c["player_name"] or c["name"]))
+        for c in outcome.eliminated:
+            if c["user_id"]:
+                await send_dm(bot, c["user_id"], "🏳️ Ваша страна разгромлена. Вы можете взять другую: /take <i>страна</i>")
         if unreachable:
-            await bot.send_message(
-                chat_id,
-                "📭 Не смог доставить секретные доклады: " + ", ".join(unreachable)
-                + ". Напишите мне в личку /start.",
-            )
-        new_label = turn_label(game["turn"] + 1, settings.start_year)
+            await bot.send_message(chat_id, "📭 Не смог доставить секретные доклады: " + ", ".join(unreachable)
+                                   + ". Напишите мне в личку /start.")
         await bot.send_message(chat_id, f"▶️ Начался новый ход: <b>{new_label}</b>. Отдавайте приказы!")

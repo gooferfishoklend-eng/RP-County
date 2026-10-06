@@ -1,21 +1,29 @@
+import json
+
 import aiosqlite
 
+from bot.geo import name_key
 from bot.stats import STAT_KEYS
+
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS games (
-    chat_id     INTEGER PRIMARY KEY,
-    title       TEXT,
-    turn        INTEGER NOT NULL DEFAULT 1,
-    status      TEXT NOT NULL DEFAULT 'active',
-    created_by  INTEGER,
-    created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+    chat_id        INTEGER PRIMARY KEY,
+    title          TEXT,
+    turn           INTEGER NOT NULL DEFAULT 1,
+    status         TEXT NOT NULL DEFAULT 'active',
+    created_by     INTEGER,
+    npc_chat       INTEGER NOT NULL DEFAULT 1,
+    random_events  INTEGER NOT NULL DEFAULT 1,
+    created_at     TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS countries (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id      INTEGER NOT NULL,
-    user_id      INTEGER NOT NULL,
+    code         TEXT NOT NULL,
+    user_id      INTEGER,
     player_name  TEXT,
     name         TEXT NOT NULL,
     name_key     TEXT NOT NULL,
@@ -32,9 +40,20 @@ CREATE TABLE IF NOT EXISTS countries (
     tech         INTEGER NOT NULL,
     corruption   INTEGER NOT NULL,
     influence    INTEGER NOT NULL,
+    capital_cell INTEGER,
+    alive        INTEGER NOT NULL DEFAULT 1,
     ready_turn   INTEGER NOT NULL DEFAULT 0,
-    UNIQUE (chat_id, user_id),
-    UNIQUE (chat_id, name_key)
+    UNIQUE (chat_id, code),
+    UNIQUE (chat_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_countries_name ON countries (chat_id, name_key);
+
+CREATE TABLE IF NOT EXISTS cells (
+    chat_id   INTEGER NOT NULL,
+    cell_id   INTEGER NOT NULL,
+    owner_id  INTEGER NOT NULL,
+    core_id   INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, cell_id)
 );
 
 CREATE TABLE IF NOT EXISTS actions (
@@ -57,14 +76,19 @@ CREATE TABLE IF NOT EXISTS relations (
     PRIMARY KEY (chat_id, a_id, b_id)
 );
 
-CREATE TABLE IF NOT EXISTS proposals (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id    INTEGER NOT NULL,
-    turn       INTEGER NOT NULL,
-    from_id    INTEGER NOT NULL,
-    to_id      INTEGER NOT NULL,
-    text       TEXT NOT NULL,
-    status     TEXT NOT NULL DEFAULT 'pending'
+CREATE TABLE IF NOT EXISTS treaties (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id     INTEGER NOT NULL,
+    turn        INTEGER NOT NULL,
+    kind        TEXT NOT NULL,
+    a_id        INTEGER NOT NULL,
+    b_id        INTEGER NOT NULL,
+    text        TEXT NOT NULL,
+    peace_mode  TEXT,
+    transfers   TEXT NOT NULL DEFAULT '[]',
+    signed_a    INTEGER NOT NULL DEFAULT 0,
+    signed_b    INTEGER NOT NULL DEFAULT 0,
+    status      TEXT NOT NULL DEFAULT 'pending'
 );
 
 CREATE TABLE IF NOT EXISTS resolutions (
@@ -92,19 +116,55 @@ CREATE TABLE IF NOT EXISTS chronicle (
     event     TEXT
 );
 
+CREATE TABLE IF NOT EXISTS generals (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id        INTEGER NOT NULL,
+    country_id     INTEGER NOT NULL,
+    name           TEXT NOT NULL,
+    rank           TEXT NOT NULL,
+    trait          TEXT NOT NULL,
+    skill          INTEGER NOT NULL,
+    xp             INTEGER NOT NULL DEFAULT 0,
+    directive      TEXT,
+    target_id      INTEGER,
+    position_cell  INTEGER,
+    alive          INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id       INTEGER NOT NULL,
+    name          TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    description   TEXT NOT NULL,
+    severity      INTEGER NOT NULL,
+    affected      TEXT NOT NULL DEFAULT '[]',
+    status        TEXT NOT NULL DEFAULT 'active',
+    started_turn  INTEGER NOT NULL,
+    updated_turn  INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS user_prefs (
     user_id         INTEGER PRIMARY KEY,
     active_chat_id  INTEGER
 );
 """
 
+GAME_TABLES = ("countries", "cells", "actions", "relations", "treaties", "resolutions", "chronicle", "generals", "events")
+ALL_TABLES = ("games", *GAME_TABLES, "votes", "user_prefs", "proposals")
 
-def name_key(name: str) -> str:
-    return " ".join(name.casefold().replace("ё", "е").split())
+COUNTRY_COLS = ["chat_id", "code", "user_id", "player_name", "name", "name_key", "flag", "government", "leader_title",
+                "description", *STAT_KEYS, "capital_cell"]
 
 
 def _pair(a: int, b: int) -> tuple[int, int]:
     return (a, b) if a < b else (b, a)
+
+
+def _event_row(row: dict | None) -> dict | None:
+    if row:
+        row["affected"] = json.loads(row["affected"])
+    return row
 
 
 class Database:
@@ -115,7 +175,13 @@ class Database:
     async def connect(self) -> None:
         self.conn = await aiosqlite.connect(self.path)
         self.conn.row_factory = aiosqlite.Row
+        async with self.conn.execute("PRAGMA user_version") as cur:
+            version = (await cur.fetchone())[0]
+        if version != SCHEMA_VERSION:
+            for table in ALL_TABLES:
+                await self.conn.execute(f"DROP TABLE IF EXISTS {table}")
         await self.conn.executescript(SCHEMA)
+        await self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         await self.conn.commit()
 
     async def close(self) -> None:
@@ -141,54 +207,99 @@ class Database:
     async def get_game(self, chat_id: int) -> dict | None:
         return await self._one("SELECT * FROM games WHERE chat_id = ?", (chat_id,))
 
-    async def create_game(self, chat_id: int, title: str, user_id: int) -> None:
-        await self.conn.execute("DELETE FROM countries WHERE chat_id = ?", (chat_id,))
-        for table in ("actions", "relations", "proposals", "resolutions", "chronicle"):
+    async def create_game(self, chat_id: int, title: str, user_id: int, countries: list[dict],
+                          cells: list[tuple[int, str]]) -> None:
+        """Reset the chat's game and seed every country (as NPC) and every map cell."""
+        for table in GAME_TABLES:
             await self.conn.execute(f"DELETE FROM {table} WHERE chat_id = ?", (chat_id,))
         await self.conn.execute(
             "INSERT OR REPLACE INTO games (chat_id, title, turn, status, created_by) VALUES (?, ?, 1, 'active', ?)",
             (chat_id, title, user_id),
+        )
+        sql = f"INSERT INTO countries ({', '.join(COUNTRY_COLS)}) VALUES ({', '.join('?' * len(COUNTRY_COLS))})"
+        rows = []
+        for c in countries:
+            data = {**c, "chat_id": chat_id, "user_id": None, "player_name": None, "name_key": name_key(c["name"])}
+            rows.append(tuple(data[k] for k in COUNTRY_COLS))
+        await self.conn.executemany(sql, rows)
+        ids = {r["code"]: r["id"] for r in await self._all("SELECT id, code FROM countries WHERE chat_id = ?", (chat_id,))}
+        await self.conn.executemany(
+            "INSERT INTO cells (chat_id, cell_id, owner_id, core_id) VALUES (?, ?, ?, ?)",
+            [(chat_id, cell_id, ids[code], ids[code]) for cell_id, code in cells if code in ids],
         )
         await self.conn.commit()
 
     async def set_game_status(self, chat_id: int, status: str) -> None:
         await self._exec("UPDATE games SET status = ? WHERE chat_id = ?", (status, chat_id))
 
+    async def set_game_flag(self, chat_id: int, flag: str, value: bool) -> None:
+        if flag not in ("npc_chat", "random_events"):
+            raise ValueError(flag)
+        await self._exec(f"UPDATE games SET {flag} = ? WHERE chat_id = ?", (int(value), chat_id))
+
     async def advance_turn(self, chat_id: int) -> None:
         await self._exec("UPDATE games SET turn = turn + 1 WHERE chat_id = ?", (chat_id,))
 
     # countries
-    async def add_country(self, chat_id: int, user_id: int, player_name: str, data: dict) -> int:
-        cols = ["chat_id", "user_id", "player_name", "name_key", "name", "flag", "government", "leader_title", "description", *STAT_KEYS]
-        values = [chat_id, user_id, player_name, name_key(data["name"])] + [data[c] for c in cols[4:]]
-        sql = f"INSERT INTO countries ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})"
-        return await self._exec(sql, tuple(values))
-
     async def get_country(self, country_id: int) -> dict | None:
         return await self._one("SELECT * FROM countries WHERE id = ?", (country_id,))
 
     async def get_country_by_user(self, chat_id: int, user_id: int) -> dict | None:
         return await self._one("SELECT * FROM countries WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
 
-    async def get_country_by_name(self, chat_id: int, name: str) -> dict | None:
-        return await self._one("SELECT * FROM countries WHERE chat_id = ? AND name_key = ?", (chat_id, name_key(name)))
+    async def get_country_by_code(self, chat_id: int, code: str) -> dict | None:
+        return await self._one("SELECT * FROM countries WHERE chat_id = ? AND code = ?", (chat_id, code))
 
     async def list_countries(self, chat_id: int) -> list[dict]:
         return await self._all("SELECT * FROM countries WHERE chat_id = ? ORDER BY id", (chat_id,))
 
+    async def list_players(self, chat_id: int) -> list[dict]:
+        return await self._all(
+            "SELECT * FROM countries WHERE chat_id = ? AND user_id IS NOT NULL AND alive = 1 ORDER BY id", (chat_id,)
+        )
+
+    async def assign_player(self, country_id: int, user_id: int, player_name: str, profile: dict) -> None:
+        stats = {k: profile[k] for k in STAT_KEYS}
+        sets = ", ".join(f"{k} = ?" for k in [*stats, "government", "leader_title", "description"])
+        await self._exec(
+            f"UPDATE countries SET user_id = ?, player_name = ?, ready_turn = 0, {sets} WHERE id = ?",
+            (user_id, player_name, *stats.values(), profile["government"], profile["leader_title"],
+             profile["description"], country_id),
+        )
+
+    async def release_player(self, country_id: int) -> None:
+        await self._exec("UPDATE countries SET user_id = NULL, player_name = NULL WHERE id = ?", (country_id,))
+
     async def update_country_stats(self, country_id: int, stats: dict) -> None:
         keys = [k for k in stats if k in STAT_KEYS]
+        if not keys:
+            return
         sql = f"UPDATE countries SET {', '.join(f'{k} = ?' for k in keys)} WHERE id = ?"
         await self._exec(sql, tuple(stats[k] for k in keys) + (country_id,))
 
-    async def delete_country(self, country_id: int) -> None:
-        await self.conn.execute("DELETE FROM countries WHERE id = ?", (country_id,))
-        await self.conn.execute("DELETE FROM relations WHERE a_id = ? OR b_id = ?", (country_id, country_id))
-        await self.conn.execute("DELETE FROM actions WHERE country_id = ?", (country_id,))
-        await self.conn.commit()
+    async def set_capital(self, country_id: int, cell_id: int) -> None:
+        await self._exec("UPDATE countries SET capital_cell = ? WHERE id = ?", (cell_id, country_id))
+
+    async def eliminate(self, country_id: int) -> None:
+        await self._exec("UPDATE countries SET alive = 0, user_id = NULL WHERE id = ?", (country_id,))
+        await self._exec("UPDATE generals SET alive = 0 WHERE country_id = ?", (country_id,))
 
     async def set_ready(self, country_id: int, turn: int) -> None:
         await self._exec("UPDATE countries SET ready_turn = ? WHERE id = ?", (turn, country_id))
+
+    # cells
+    async def cell_owners(self, chat_id: int) -> tuple[dict[int, int], dict[int, int]]:
+        rows = await self._all("SELECT cell_id, owner_id, core_id FROM cells WHERE chat_id = ?", (chat_id,))
+        return {r["cell_id"]: r["owner_id"] for r in rows}, {r["cell_id"]: r["core_id"] for r in rows}
+
+    async def set_cell_owner(self, chat_id: int, cell_id: int, owner_id: int, core_id: int | None = None) -> None:
+        if core_id is None:
+            await self.conn.execute("UPDATE cells SET owner_id = ? WHERE chat_id = ? AND cell_id = ?",
+                                    (owner_id, chat_id, cell_id))
+        else:
+            await self.conn.execute("UPDATE cells SET owner_id = ?, core_id = ? WHERE chat_id = ? AND cell_id = ?",
+                                    (owner_id, core_id, chat_id, cell_id))
+        await self.conn.commit()
 
     # actions
     async def add_action(self, chat_id: int, turn: int, country_id: int, kind: str, text: str, target: str | None = None) -> int:
@@ -207,7 +318,8 @@ class Database:
 
     async def delete_last_action(self, chat_id: int, turn: int, country_id: int) -> dict | None:
         row = await self._one(
-            "SELECT * FROM actions WHERE chat_id = ? AND turn = ? AND country_id = ? ORDER BY id DESC LIMIT 1",
+            "SELECT * FROM actions WHERE chat_id = ? AND turn = ? AND country_id = ? "
+            "AND kind NOT IN ('treaty', 'npc_deal') ORDER BY id DESC LIMIT 1",
             (chat_id, turn, country_id),
         )
         if row:
@@ -233,18 +345,31 @@ class Database:
     async def list_relations(self, chat_id: int) -> list[dict]:
         return await self._all("SELECT * FROM relations WHERE chat_id = ?", (chat_id,))
 
-    # proposals
-    async def add_proposal(self, chat_id: int, turn: int, from_id: int, to_id: int, text: str) -> int:
+    async def wars(self, chat_id: int) -> list[tuple[int, int]]:
+        rows = await self._all("SELECT a_id, b_id FROM relations WHERE chat_id = ? AND status = 'war'", (chat_id,))
+        return [(r["a_id"], r["b_id"]) for r in rows]
+
+    # treaties
+    async def add_treaty(self, chat_id: int, turn: int, kind: str, a_id: int, b_id: int, text: str,
+                         peace_mode: str | None = None, transfers: list | None = None) -> int:
         return await self._exec(
-            "INSERT INTO proposals (chat_id, turn, from_id, to_id, text) VALUES (?, ?, ?, ?, ?)",
-            (chat_id, turn, from_id, to_id, text),
+            "INSERT INTO treaties (chat_id, turn, kind, a_id, b_id, text, peace_mode, transfers, signed_a) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
+            (chat_id, turn, kind, a_id, b_id, text, peace_mode, json.dumps(transfers or [])),
         )
 
-    async def get_proposal(self, proposal_id: int) -> dict | None:
-        return await self._one("SELECT * FROM proposals WHERE id = ?", (proposal_id,))
+    async def get_treaty(self, treaty_id: int) -> dict | None:
+        row = await self._one("SELECT * FROM treaties WHERE id = ?", (treaty_id,))
+        if row:
+            row["transfers"] = json.loads(row["transfers"])
+        return row
 
-    async def set_proposal_status(self, proposal_id: int, status: str) -> None:
-        await self._exec("UPDATE proposals SET status = ? WHERE id = ?", (status, proposal_id))
+    async def sign_treaty(self, treaty_id: int, side: str) -> None:
+        col = "signed_a" if side == "a" else "signed_b"
+        await self._exec(f"UPDATE treaties SET {col} = 1 WHERE id = ?", (treaty_id,))
+
+    async def set_treaty_status(self, treaty_id: int, status: str) -> None:
+        await self._exec("UPDATE treaties SET status = ? WHERE id = ?", (status, treaty_id))
 
     # resolutions
     async def add_resolution(self, chat_id: int, turn: int, author_id: int, text: str) -> int:
@@ -283,10 +408,51 @@ class Database:
         )
 
     async def recent_chronicle(self, chat_id: int, limit: int = 3) -> list[dict]:
-        rows = await self._all(
-            "SELECT * FROM chronicle WHERE chat_id = ? ORDER BY turn DESC LIMIT ?", (chat_id, limit)
-        )
+        rows = await self._all("SELECT * FROM chronicle WHERE chat_id = ? ORDER BY turn DESC LIMIT ?", (chat_id, limit))
         return list(reversed(rows))
+
+    # generals
+    async def add_general(self, chat_id: int, country_id: int, name: str, rank: str, trait: str, skill: int,
+                          position_cell: int | None) -> int:
+        return await self._exec(
+            "INSERT INTO generals (chat_id, country_id, name, rank, trait, skill, position_cell) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, country_id, name, rank, trait, skill, position_cell),
+        )
+
+    async def list_generals(self, chat_id: int, country_id: int | None = None) -> list[dict]:
+        if country_id is None:
+            return await self._all("SELECT * FROM generals WHERE chat_id = ? AND alive = 1 ORDER BY id", (chat_id,))
+        return await self._all("SELECT * FROM generals WHERE chat_id = ? AND country_id = ? AND alive = 1 ORDER BY id",
+                               (chat_id, country_id))
+
+    async def get_general(self, general_id: int) -> dict | None:
+        return await self._one("SELECT * FROM generals WHERE id = ?", (general_id,))
+
+    async def update_general(self, general_id: int, **fields) -> None:
+        allowed = {"directive", "target_id", "position_cell", "xp", "skill", "alive", "name", "rank", "trait"}
+        keys = [k for k in fields if k in allowed]
+        sql = f"UPDATE generals SET {', '.join(f'{k} = ?' for k in keys)} WHERE id = ?"
+        await self._exec(sql, tuple(fields[k] for k in keys) + (general_id,))
+
+    # events
+    async def add_event(self, chat_id: int, turn: int, name: str, kind: str, description: str, severity: int,
+                        affected: list[int]) -> int:
+        return await self._exec(
+            "INSERT INTO events (chat_id, name, kind, description, severity, affected, started_turn, updated_turn) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, name, kind, description, severity, json.dumps(affected), turn, turn),
+        )
+
+    async def update_event(self, event_id: int, turn: int, description: str, severity: int, affected: list[int],
+                           status: str) -> None:
+        await self._exec(
+            "UPDATE events SET description = ?, severity = ?, affected = ?, status = ?, updated_turn = ? WHERE id = ?",
+            (description, severity, json.dumps(affected), status, turn, event_id),
+        )
+
+    async def active_events(self, chat_id: int) -> list[dict]:
+        rows = await self._all("SELECT * FROM events WHERE chat_id = ? AND status = 'active' ORDER BY id", (chat_id,))
+        return [_event_row(r) for r in rows]
 
     # user prefs
     async def set_active_chat(self, user_id: int, chat_id: int) -> None:

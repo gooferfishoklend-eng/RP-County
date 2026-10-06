@@ -2,3 +2,6 @@ aiogram>=3.31,<4
 anthropic>=1.11,<2
 aiosqlite>=0.22
 pydantic-settings>=2.15
+shapely>=2.1
+matplotlib>=3.10
+numpy>=2.0
