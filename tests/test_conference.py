@@ -107,3 +107,22 @@ async def test_execute_terms_applies_everything(db):
     assert (await db.get_conference(conf["id"]))["status"] == "signed"
     snapshot = await world_snapshot(db, CHAT)
     assert snapshot["agreements_in_force"][0]["title"] == "Стамбульский договор"
+
+
+async def test_migrate_chat_moves_game_and_room(db):
+    ukr = await take(db, 1, "UKR")
+    await db.set_active_chat(1, CHAT)
+    await db.add_room(ROOM, CHAT, "room")
+    new_game, new_room = -1009990000001, -1009990000002
+    assert CHAT > -1000000000000 and await db.basic_group_game_ids() == [CHAT]
+
+    assert await db.migrate_chat(CHAT, new_game)
+    assert await db.get_game(CHAT) is None and (await db.get_game(new_game))["turn"] == 1
+    assert (await db.get_country_by_user(new_game, 1))["id"] == ukr["id"]
+    assert len((await db.cell_owners(new_game))[0]) > 4000
+    assert await db.get_active_chat(1) == new_game
+    assert (await db.get_room(ROOM))["game_chat_id"] == new_game
+
+    assert await db.migrate_chat(ROOM, new_room)
+    assert await db.get_room(ROOM) is None and (await db.get_room(new_room))["game_chat_id"] == new_game
+    assert not await db.migrate_chat(CHAT, new_game)

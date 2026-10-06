@@ -12,6 +12,7 @@ from bot.db import Database
 from bot.geo import load_world
 from bot.llm import make_backend
 from bot.handlers import setup_routers
+from bot.handlers.common import heal_migrations
 
 COMMANDS = [
     BotCommand(command="help", description="Правила и команды"),
@@ -65,6 +66,8 @@ async def main() -> None:
     dp.include_router(setup_routers())
 
     await bot.set_my_commands(COMMANDS)
+    for old_id, new_id in await heal_migrations(bot, db):
+        logging.info("recovered game from upgraded group %s -> %s", old_id, new_id)
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:

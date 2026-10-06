@@ -9,15 +9,33 @@ from bot.ai import AIError, GameMaster
 from bot.config import Settings
 from bot.db import Database
 from bot.game import EVENT_ICONS, new_game
-from bot.handlers.common import finish_turn, game_chat_id, is_admin, is_private, send_map
+from bot.handlers.common import finish_turn, game_chat_id, get_game_healed, is_admin, is_private, send_map
+from bot.handlers.conference import register_room
 from bot.stats import turn_label
 from bot.texts import HELP, ranking
 
 router = Router()
 
 
+@router.message(F.migrate_to_chat_id)
+async def on_migrated_to(message: Message, db: Database):
+    await db.migrate_chat(message.chat.id, message.migrate_to_chat_id)
+
+
+@router.message(F.migrate_from_chat_id)
+async def on_migrated_from(message: Message, db: Database):
+    await db.migrate_chat(message.migrate_from_chat_id, message.chat.id)
+
+
 @router.message(CommandStart())
-async def cmd_start(message: Message, command: CommandObject, db: Database):
+async def cmd_start(message: Message, command: CommandObject, bot: Bot, db: Database):
+    if not is_private(message) and command.args and command.args.startswith("room_"):
+        try:
+            game_chat = int(command.args.removeprefix("room_"))
+        except ValueError:
+            return
+        await register_room(message, bot, db, game_chat)
+        return
     if is_private(message) and command.args and command.args.startswith("play_"):
         try:
             chat_id = int(command.args.removeprefix("play_"))
@@ -44,7 +62,7 @@ async def cmd_newgame(message: Message, bot: Bot, db: Database):
     if not await is_admin(bot, message.chat.id, message.from_user.id):
         await message.answer("Начать новую игру может только администратор группы.")
         return
-    game = await db.get_game(message.chat.id)
+    game = await get_game_healed(bot, db, message.chat.id)
     if game and game["status"] == "active" and await db.list_players(message.chat.id):
         kb = InlineKeyboardBuilder()
         kb.button(text="🔄 Да, начать заново", callback_data="newgame:yes")

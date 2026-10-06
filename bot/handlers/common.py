@@ -4,7 +4,7 @@ from html import escape
 
 from aiogram import Bot
 from aiogram.enums import ChatMemberStatus, ChatType
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError, TelegramMigrateToChat
 from aiogram.types import BufferedInputFile, Message
 
 from bot.ai import AIError, GameMaster
@@ -36,6 +36,29 @@ async def game_chat_id(message: Message, db: Database) -> int | None:
     return message.chat.id
 
 
+async def heal_migrations(bot: Bot, db: Database) -> list[tuple[int, int]]:
+    """Find games stored under a basic-group id whose group Telegram has upgraded to a supergroup, and move them."""
+    moved = []
+    for old_id in await db.basic_group_game_ids():
+        try:
+            await bot.send_chat_action(old_id, "typing")
+        except TelegramMigrateToChat as e:
+            if await db.migrate_chat(old_id, e.migrate_to_chat_id):
+                log.info("game chat %s migrated to %s", old_id, e.migrate_to_chat_id)
+                moved.append((old_id, e.migrate_to_chat_id))
+        except TelegramAPIError:
+            continue
+    return moved
+
+
+async def get_game_healed(bot: Bot, db: Database, chat_id: int) -> dict | None:
+    game = await db.get_game(chat_id)
+    if game is None and chat_id <= -1000000000000:
+        await heal_migrations(bot, db)
+        game = await db.get_game(chat_id)
+    return game
+
+
 async def player_context(message: Message, db: Database) -> tuple[dict, dict] | None:
     """Find the active game and the sender's country, replying with a hint if missing."""
     user_id = message.from_user.id
@@ -43,7 +66,7 @@ async def player_context(message: Message, db: Database) -> tuple[dict, dict] | 
     if chat_id is None:
         await message.answer("Вы ещё не играете. Возьмите страну в группе командой /take, затем выберите игру через /play.")
         return None
-    game = await db.get_game(chat_id)
+    game = await get_game_healed(message.bot, db, chat_id)
     if not game or game["status"] != "active":
         await message.answer("В этой группе нет активной игры. Админ может начать её командой /newgame.")
         return None

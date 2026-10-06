@@ -579,6 +579,30 @@ class Database:
     async def conference_log(self, conference_id: int) -> list[dict]:
         return await self._all("SELECT * FROM conference_log WHERE conference_id = ? ORDER BY id", (conference_id,))
 
+    # group -> supergroup migration (Telegram changes the chat id)
+    async def migrate_chat(self, old_id: int, new_id: int) -> bool:
+        """Move every record of chat old_id to new_id. Returns True if anything moved."""
+        if old_id == new_id:
+            return False
+        moved = False
+        if await self.get_game(old_id) and not await self.get_game(new_id):
+            for table in ("games", *GAME_TABLES):
+                await self.conn.execute(f"UPDATE {table} SET chat_id = ? WHERE chat_id = ?", (new_id, old_id))
+            await self.conn.execute("UPDATE user_prefs SET active_chat_id = ? WHERE active_chat_id = ?", (new_id, old_id))
+            await self.conn.execute("UPDATE rooms SET game_chat_id = ? WHERE game_chat_id = ?", (new_id, old_id))
+            moved = True
+        if await self.get_room(old_id) and not await self.get_room(new_id):
+            await self.conn.execute("UPDATE rooms SET room_chat_id = ? WHERE room_chat_id = ?", (new_id, old_id))
+            await self.conn.execute("UPDATE conferences SET room_chat_id = ? WHERE room_chat_id = ?", (new_id, old_id))
+            moved = True
+        await self.conn.commit()
+        return moved
+
+    async def basic_group_game_ids(self) -> list[int]:
+        """Games stored under a basic-group id (supergroups are <= -100xxxxxxxxxx) that may have been migrated."""
+        rows = await self._all("SELECT chat_id FROM games WHERE chat_id < 0 AND chat_id > -1000000000000")
+        return [r["chat_id"] for r in rows]
+
     # user prefs
     async def set_active_chat(self, user_id: int, chat_id: int) -> None:
         await self._exec("INSERT OR REPLACE INTO user_prefs (user_id, active_chat_id) VALUES (?, ?)", (user_id, chat_id))

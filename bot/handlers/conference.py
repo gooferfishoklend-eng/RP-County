@@ -13,7 +13,7 @@ from bot.ai import AIError, GameMaster
 from bot.conference import clean_terms, conference_context, execute_terms, participants, render_terms
 from bot.config import Settings
 from bot.db import Database
-from bot.handlers.common import find_country, is_admin, is_private, player_context, send_dm
+from bot.handlers.common import find_country, get_game_healed, is_admin, is_private, player_context, send_dm
 from bot.texts import split_message
 
 log = logging.getLogger(__name__)
@@ -68,59 +68,120 @@ async def close_room(bot: Bot, db: Database, conf: dict) -> None:
 
 # --- room setup -------------------------------------------------------------
 
-@router.message(Command("addroom"), F.chat.type != "private")
-async def cmd_addroom(message: Message, bot: Bot, db: Database):
-    if not await is_admin(bot, message.chat.id, message.from_user.id):
-        await message.answer("Комнаты переговоров добавляют администраторы.")
-        return
-    rooms = await db.list_rooms(message.chat.id)
-    await message.answer(
-        "🏛 <b>Как добавить комнату для мирных конференций</b>\n\n"
-        "Боты в Telegram не могут сами создавать группы, поэтому комнату создаёте вы один раз — дальше бот всё делает сам:\n"
-        "1. Создайте новую пустую группу (любое название).\n"
-        "2. Добавьте туда меня и сделайте <b>администратором</b> с правами: приглашать по ссылке, блокировать, "
-        "удалять сообщения, менять информацию.\n"
-        f"3. Напишите в той группе: <code>/room {message.chat.id}</code>\n\n"
-        "Можно добавить несколько комнат, чтобы шло несколько конференций одновременно.\n"
-        f"Сейчас комнат: {len(rooms)}."
-    )
+ROOM_RIGHTS = {
+    "can_invite_users": "приглашать пользователей",
+    "can_restrict_members": "блокировать участников",
+    "can_delete_messages": "удалять сообщения",
+}
+LINK_RIGHTS = "change_info+delete_messages+restrict_members+invite_users"
 
 
-@router.message(Command("room"), F.chat.type != "private")
-async def cmd_room(message: Message, command: CommandObject, bot: Bot, db: Database):
+async def missing_rights(bot: Bot, room_id: int) -> list[str]:
+    me = await bot.get_chat_member(room_id, (await bot.me()).id)
+    if me.status != ChatMemberStatus.ADMINISTRATOR:
+        return list(ROOM_RIGHTS.values())
+    return [title for attr, title in ROOM_RIGHTS.items() if not getattr(me, attr, False)]
+
+
+async def register_room(message: Message, bot: Bot, db: Database, game_chat: int) -> None:
+    room_id = message.chat.id
+    if game_chat == room_id:
+        await message.answer(
+            "Вы указали ID этой же группы. Комната переговоров — это <b>отдельная</b> группа.\n"
+            "Откройте игровую группу (где запускали /newgame), напишите там /addroom и нажмите кнопку "
+            "«Подключить комнату» — бот подключит её сам."
+        )
+        return
+    game = await get_game_healed(bot, db, game_chat)
+    if not game or game["status"] != "active":
+        await message.answer(
+            f"В группе <code>{game_chat}</code> нет активной игры.\n"
+            "Откройте игровую группу (где запускали /newgame), напишите там /addroom и нажмите кнопку "
+            "«Подключить комнату». Если игра ещё не начата — сначала /newgame."
+        )
+        return
+    if await db.get_game(room_id):
+        await message.answer("В этой группе идёт своя игра, её нельзя сделать комнатой. Создайте отдельную пустую группу.")
+        return
     try:
-        game_chat = int((command.args or "").strip())
-    except ValueError:
-        await message.answer("Формат: <code>/room ID_игровой_группы</code> — ID покажет команда /addroom в игровой группе.")
-        return
-    if game_chat == message.chat.id:
-        await message.answer("Это игровая группа. Команду /room нужно писать в отдельной группе-комнате.")
-        return
-    game = await db.get_game(game_chat)
-    if not game:
-        await message.answer("В указанной группе нет игры.")
-        return
-    try:
-        if not await is_admin(bot, game_chat, message.from_user.id):
+        if not await is_admin(bot, game["chat_id"], message.from_user.id):
             await message.answer("Подключать комнаты может только администратор игровой группы.")
             return
     except TG_ERRORS:
         await message.answer("Не вижу игровую группу — я в ней состою?")
         return
-    me = await bot.get_chat_member(message.chat.id, (await bot.me()).id)
-    needed = ("can_invite_users", "can_restrict_members", "can_delete_messages")
-    if me.status != ChatMemberStatus.ADMINISTRATOR or not all(getattr(me, r, False) for r in needed):
-        await message.answer("Сделайте меня администратором этой группы с правами: приглашать пользователей, "
-                             "блокировать, удалять сообщения (и желательно менять информацию). Потом повторите /room.")
+    existing = await db.get_room(room_id)
+    if existing and existing["game_chat_id"] == game["chat_id"]:
+        missing = await missing_rights(bot, room_id)
+        await message.answer("Эта комната уже подключена к игре. " + (
+            "Все права на месте ✅" if not missing else "⚠️ Не хватает прав: " + ", ".join(missing) + "."))
         return
-    await db.add_room(message.chat.id, game_chat, message.chat.title or "")
+    await db.add_room(room_id, game["chat_id"], message.chat.title or "")
     try:
-        await bot.set_chat_title(message.chat.id, ROOM_TITLE)
+        await bot.set_chat_title(room_id, ROOM_TITLE)
     except TG_ERRORS:
         pass
-    await message.answer("✅ Комната переговоров подключена. Здесь будут проходить мирные конференции.")
-    await bot.send_message(game_chat, "🏛 Подключена новая комната переговоров. Созвать конференцию: "
-                                      "/conference <i>страна, страна</i> | <i>тема</i>")
+    missing = await missing_rights(bot, room_id)
+    text = "✅ Комната переговоров подключена. Здесь будут проходить мирные конференции."
+    if missing:
+        text += ("\n\n⚠️ Чтобы проводить конференции, мне нужны права администратора: " + ", ".join(missing)
+                 + ". Выдайте их и напишите /room — я проверю.")
+    await message.answer(text)
+    await bot.send_message(game["chat_id"], "🏛 Подключена новая комната переговоров. Созвать конференцию: "
+                                            "/conference <i>страна, страна</i> | <i>тема</i>")
+
+
+@router.message(Command("addroom"), F.chat.type != "private")
+async def cmd_addroom(message: Message, bot: Bot, db: Database):
+    if await db.get_room(message.chat.id):
+        await message.answer("Это комната переговоров. Команду /addroom пишут в <b>игровой группе</b>, где идёт игра.")
+        return
+    game = await get_game_healed(bot, db, message.chat.id)
+    if not game or game["status"] != "active":
+        await message.answer(
+            "Здесь нет игры. Команду /addroom пишут в <b>игровой группе</b> — там, где запускали /newgame.\n"
+            "Если эта группа должна стать комнатой переговоров — откройте игровую группу, напишите там /addroom "
+            "и нажмите кнопку «Подключить комнату»."
+        )
+        return
+    if not await is_admin(bot, message.chat.id, message.from_user.id):
+        await message.answer("Комнаты переговоров добавляют администраторы.")
+        return
+    rooms = await db.list_rooms(message.chat.id)
+    me = await bot.me()
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Подключить комнату",
+              url=f"https://t.me/{me.username}?startgroup=room_{message.chat.id}&admin={LINK_RIGHTS}")
+    await message.answer(
+        "🏛 <b>Комната для мирных конференций</b>\n\n"
+        "Боты Telegram не умеют сами создавать группы, поэтому комнату нужно подключить один раз:\n"
+        "1. Нажмите кнопку ниже.\n"
+        "2. Выберите пустую группу (или создайте новую). Telegram сразу предложит дать мне права администратора — "
+        "подтвердите.\n"
+        "3. Всё — я подключу комнату сам и отпишусь здесь.\n\n"
+        f"<i>Вручную: добавьте меня в группу администратором и напишите там</i> <code>/room {message.chat.id}</code>\n\n"
+        f"Можно подключить несколько комнат для параллельных конференций. Сейчас комнат: {len(rooms)}.",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@router.message(Command("room"), F.chat.type != "private")
+async def cmd_room(message: Message, command: CommandObject, bot: Bot, db: Database):
+    arg = (command.args or "").strip()
+    if not arg:
+        if not await db.get_room(message.chat.id):
+            await message.answer("Эта группа не подключена как комната. Напишите /addroom в игровой группе и нажмите кнопку.")
+            return
+        missing = await missing_rights(bot, message.chat.id)
+        await message.answer("✅ Комната подключена, все права на месте." if not missing else
+                             "⚠️ Не хватает прав администратора: " + ", ".join(missing) + ".")
+        return
+    try:
+        game_chat = int(arg)
+    except ValueError:
+        await message.answer("Формат: <code>/room ID_игровой_группы</code>. Проще — нажать кнопку из /addroom в игровой группе.")
+        return
+    await register_room(message, bot, db, game_chat)
 
 
 @router.message(Command("rooms"))
