@@ -63,11 +63,13 @@ async def cmd_newgame(message: Message, bot: Bot, db: Database):
         await message.answer("Начать новую игру может только администратор группы.")
         return
     game = await get_game_healed(bot, db, message.chat.id)
-    if game and game["status"] == "active" and await db.list_players(message.chat.id):
+    if game and (game["turn"] > 1 or await db.list_players(message.chat.id)):
         kb = InlineKeyboardBuilder()
-        kb.button(text="🔄 Да, начать заново", callback_data="newgame:yes")
+        kb.button(text="🔄 Да, удалить и начать заново", callback_data="newgame:yes")
         kb.button(text="Отмена", callback_data="newgame:no")
-        await message.answer("⚠️ Уже идёт игра. Начать новую? Весь прогресс будет удалён.", reply_markup=kb.as_markup())
+        state = "Уже идёт игра" if game["status"] == "active" else "Здесь есть завершённая игра (её можно продолжить: /resumegame)"
+        await message.answer(f"⚠️ {state}. Начать новую? <b>Весь прогресс будет удалён безвозвратно.</b>",
+                             reply_markup=kb.as_markup())
         return
     await _start_game(message.chat.id, message.chat.title or "Мир", message.from_user.id, message, bot, db)
 
@@ -189,8 +191,46 @@ async def cmd_endgame(message: Message, bot: Bot, db: Database):
     if not game or game["status"] != "active":
         await message.answer("Активной игры нет.")
         return
-    await db.set_game_status(message.chat.id, "ended")
-    await message.answer("🏁 <b>Игра окончена!</b> Итоговый рейтинг:\n\n" + ranking(await db.list_players(message.chat.id)))
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🏁 Да, завершить", callback_data="endgame:yes")
+    kb.button(text="Отмена", callback_data="endgame:no")
+    await message.answer("Завершить игру и подвести итоги? (Потом её можно будет продолжить командой /resumegame.)",
+                         reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data.startswith("endgame:"))
+async def cb_endgame(call: CallbackQuery, bot: Bot, db: Database):
+    if not await is_admin(bot, call.message.chat.id, call.from_user.id):
+        await call.answer("Только для администраторов", show_alert=True)
+        return
+    await call.answer()
+    if call.data != "endgame:yes":
+        await call.message.edit_text("Игра продолжается.")
+        return
+    game = await db.get_game(call.message.chat.id)
+    if not game or game["status"] != "active":
+        await call.message.edit_text("Активной игры нет.")
+        return
+    await db.set_game_status(call.message.chat.id, "ended")
+    await call.message.edit_text("🏁 <b>Игра окончена!</b> Итоговый рейтинг:\n\n" + ranking(await db.list_players(call.message.chat.id))
+                                 + "\n\nПередумали? /resumegame — продолжить с того же места.")
+
+
+@router.message(Command("resumegame"), F.chat.type != "private")
+async def cmd_resumegame(message: Message, bot: Bot, db: Database, settings: Settings):
+    if not await is_admin(bot, message.chat.id, message.from_user.id):
+        await message.answer("Продолжить игру может только администратор группы.")
+        return
+    game = await get_game_healed(bot, db, message.chat.id)
+    if not game:
+        await message.answer("В этой группе нет сохранённой игры.")
+        return
+    if game["status"] == "active":
+        await message.answer("Игра и так идёт.")
+        return
+    await db.set_game_status(message.chat.id, "active")
+    await message.answer(f"▶️ <b>Игра продолжается!</b> {turn_label(game['turn'], settings.start_year)}, все страны, карта, "
+                         "войны и договоры на месте. Отдавайте приказы!")
 
 
 @router.message(Command("endturn"), F.chat.type != "private")
