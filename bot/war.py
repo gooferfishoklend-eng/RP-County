@@ -17,6 +17,7 @@ def army_power(c: dict) -> float:
     power = c["military"] * (0.7 + c["stability"] / 300) * (0.8 + c["tech"] / 250) * econ
     if c["budget"] < 0:
         power *= 0.85
+    power *= 1 + c.get("support_bonus", 0)
     return max(1.0, power)
 
 

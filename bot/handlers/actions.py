@@ -9,7 +9,8 @@ from bot.ai import GameMaster
 from bot.config import Settings
 from bot.db import Database
 from bot.game import ACTION_KINDS, declare_war
-from bot.handlers.common import find_country, finish_turn, is_private, player_context, send_dm
+from bot.support import KINDS as SUPPORT_KINDS, give_support, needs_amount, parse_kind
+from bot.handlers.common import find_country, finish_turn, game_chat_id, is_private, player_context, send_dm
 
 router = Router()
 
@@ -112,6 +113,17 @@ async def _targeted(message: Message, command: CommandObject, bot: Bot, db: Data
 
 @router.message(Command("war"))
 async def cmd_war(message: Message, command: CommandObject, bot: Bot, db: Database, gm: GameMaster, settings: Settings):
+    chat_id = await game_chat_id(message, db)
+    target_name = parse_parts(command.args)[0]
+    if chat_id and target_name:
+        me = await db.get_country_by_user(chat_id, message.from_user.id)
+        target = await find_country(db, chat_id, target_name)
+        if me and target:
+            ours, theirs = await db.alliance_of(chat_id, me["id"]), await db.alliance_of(chat_id, target["id"])
+            if ours and theirs and ours["id"] == theirs["id"]:
+                await message.answer(f"⛔️ {escape(target['name'])} — ваш союзник по «{escape(ours['name'])}». "
+                                     "Чтобы воевать, сначала выйдите из союза или исключите её.")
+                return
     res = await _targeted(message, command, bot, db, settings, "war", "цель войны / приказ армии")
     if not res:
         return
@@ -126,6 +138,13 @@ async def cmd_war(message: Message, command: CommandObject, bot: Bot, db: Databa
         side = me if g["country_id"] == me["id"] else target
         lines.append(f"🎖 {side['flag']} Командование фронтом: {escape(g['rank'])} {escape(g['name'])} "
                      f"({escape(g['trait'])}, навык {g['skill']}/10)")
+    bloc = await db.alliance_of(game["chat_id"], target["id"])
+    if bloc:
+        allies = [await db.get_country(cid) for cid in await db.alliance_members(bloc["id"]) if cid != target["id"]]
+        if allies:
+            lines.append(f"\n⚠️ {escape(target['name'])} — член союза «{escape(bloc['name'])}». Союзники: "
+                         + ", ".join(f"{a['flag']} {escape(a['name'])}" for a in allies)
+                         + ". Они могут вступить в войну (/war) или помочь (/support).")
     lines.append("\nКомандуйте генералами: /generals, /command · Карта фронта: /map " + escape(target["name"]))
     await bot.send_message(game["chat_id"], "\n".join(lines))
 
@@ -145,6 +164,56 @@ async def cmd_aid(message: Message, command: CommandObject, bot: Bot, db: Databa
     if res:
         game, me, target = res
         await db.change_relation(game["chat_id"], me["id"], target["id"], 5)
+
+
+@router.message(Command("support"))
+async def cmd_support(message: Message, command: CommandObject, bot: Bot, db: Database):
+    ctx = await player_context(message, db)
+    if not ctx:
+        return
+    game, me = ctx
+    target_name, kind_raw, rest = parse_parts(command.args, 3)
+    kind = parse_kind(kind_raw) if kind_raw else None
+    if not target_name or not kind:
+        await message.answer(
+            "Формат: /support <i>страна</i> | <i>вид</i> | <i>сумма, млрд $</i> | <i>комментарий</i>\n"
+            "Виды: <b>деньги</b>, <b>оружие</b>, <b>гуманитарка</b> (нужна сумма), <b>войска</b> (корпус на 2 хода), "
+            "<b>разведка</b> (бонус к ударам на ход).\n"
+            "Пример: <code>/support Украина | оружие | 5 | ПВО и снаряды</code>\n"
+            "В личке боту — тайная поддержка, в группе — публичная."
+        )
+        return
+    target = await find_country(db, game["chat_id"], target_name)
+    if not target:
+        await message.answer(f"Не нашёл страну «{escape(target_name)}».")
+        return
+    amount_raw, _, note = rest.partition("|")
+    amount = 0.0
+    if needs_amount(kind):
+        try:
+            amount = float(amount_raw.strip().replace(",", ".").split()[0])
+        except (ValueError, IndexError):
+            await message.answer("Укажите сумму в млрд $, например: <code>/support Украина | деньги | 3</code>")
+            return
+    else:
+        note = rest
+    secret = is_private(message)
+    ok, effect = await give_support(db, game["chat_id"], game["turn"], me, target, kind, amount, note.strip(), secret)
+    if not ok:
+        await message.answer(f"⚠️ {escape(effect)}")
+        return
+    if not target["user_id"]:
+        await db.remember(game["chat_id"], game["turn"], target["id"], me["id"], "support", me["name"],
+                          f"Получили от них поддержку: {SUPPORT_KINDS[kind]} {amount:g} млрд $. {note.strip()}", secret)
+    text = (f"📦 {me['flag']} <b>{escape(me['name'])}</b> → {target['flag']} <b>{escape(target['name'])}</b>: "
+            f"{SUPPORT_KINDS[kind]}" + (f" на {amount:g} млрд $" if amount else "") + f"\nЭффект: {escape(effect)}"
+            + (f"\n«{escape(note.strip())}»" if note.strip() else ""))
+    if secret:
+        await message.answer("🤫 Тайная поддержка оказана.\n" + text)
+        if target["user_id"]:
+            await send_dm(bot, target["user_id"], "🤫 Вам тайно оказали поддержку!\n" + text)
+    else:
+        await message.answer(text)
 
 
 @router.message(Command("actions"))

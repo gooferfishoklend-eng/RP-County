@@ -9,7 +9,15 @@ from bot.stats import STAT_KEYS
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+
+# Applied in order to bring an older database up to date without losing the game.
+MIGRATIONS = {
+    3: [
+        "ALTER TABLE countries ADD COLUMN notes TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE games ADD COLUMN history TEXT NOT NULL DEFAULT ''",
+    ],
+}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS games (
@@ -20,6 +28,7 @@ CREATE TABLE IF NOT EXISTS games (
     created_by     INTEGER,
     npc_chat       INTEGER NOT NULL DEFAULT 1,
     random_events  INTEGER NOT NULL DEFAULT 1,
+    history        TEXT NOT NULL DEFAULT '',
     created_at     TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -47,6 +56,7 @@ CREATE TABLE IF NOT EXISTS countries (
     capital_cell INTEGER,
     alive        INTEGER NOT NULL DEFAULT 1,
     ready_turn   INTEGER NOT NULL DEFAULT 0,
+    notes        TEXT NOT NULL DEFAULT '',
     UNIQUE (chat_id, code),
     UNIQUE (chat_id, user_id)
 );
@@ -187,6 +197,57 @@ CREATE TABLE IF NOT EXISTS conference_log (
     text           TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS memory (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id    INTEGER NOT NULL,
+    turn       INTEGER NOT NULL,
+    npc_id     INTEGER NOT NULL,
+    other_id   INTEGER,
+    kind       TEXT NOT NULL,
+    private    INTEGER NOT NULL DEFAULT 0,
+    speaker    TEXT NOT NULL,
+    text       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory ON memory (chat_id, npc_id, id);
+
+CREATE TABLE IF NOT EXISTS supports (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id     INTEGER NOT NULL,
+    turn        INTEGER NOT NULL,
+    from_id     INTEGER NOT NULL,
+    to_id       INTEGER NOT NULL,
+    kind        TEXT NOT NULL,
+    amount      REAL NOT NULL DEFAULT 0,
+    note        TEXT,
+    secret      INTEGER NOT NULL DEFAULT 0,
+    turns_left  INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS alliances (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id       INTEGER NOT NULL,
+    name          TEXT NOT NULL,
+    charter       TEXT NOT NULL DEFAULT '',
+    leader_id     INTEGER NOT NULL,
+    created_turn  INTEGER NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'active'
+);
+
+CREATE TABLE IF NOT EXISTS alliance_members (
+    alliance_id  INTEGER NOT NULL,
+    country_id   INTEGER NOT NULL,
+    joined_turn  INTEGER NOT NULL,
+    PRIMARY KEY (alliance_id, country_id)
+);
+
+CREATE TABLE IF NOT EXISTS alliance_requests (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    alliance_id  INTEGER NOT NULL,
+    country_id   INTEGER NOT NULL,
+    kind         TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'pending'
+);
+
 CREATE TABLE IF NOT EXISTS user_prefs (
     user_id         INTEGER PRIMARY KEY,
     active_chat_id  INTEGER
@@ -194,8 +255,9 @@ CREATE TABLE IF NOT EXISTS user_prefs (
 """
 
 GAME_TABLES = ("countries", "cells", "actions", "relations", "treaties", "resolutions", "chronicle", "generals", "events",
-               "conferences")
-ALL_TABLES = ("games", *GAME_TABLES, "votes", "user_prefs", "proposals", "rooms", "conference_members", "conference_log")
+               "conferences", "memory", "supports", "alliances")
+ALL_TABLES = ("games", *GAME_TABLES, "votes", "user_prefs", "proposals", "rooms", "conference_members", "conference_log",
+              "alliance_members", "alliance_requests")
 
 COUNTRY_COLS = ["chat_id", "code", "user_id", "player_name", "name", "name_key", "flag", "government", "leader_title",
                 "description", *STAT_KEYS, "capital_cell"]
@@ -215,6 +277,7 @@ class Database:
     def __init__(self, path: str):
         self.path = path
         self.conn: aiosqlite.Connection | None = None
+        self.migrated_from: int | None = None
 
     async def connect(self) -> None:
         self.conn = await aiosqlite.connect(self.path)
@@ -223,10 +286,17 @@ class Database:
             version = (await cur.fetchone())[0]
         async with self.conn.execute("SELECT count(*) FROM sqlite_master WHERE type = 'table'") as cur:
             has_tables = (await cur.fetchone())[0] > 0
-        if version != SCHEMA_VERSION and has_tables:
+        if has_tables and version != SCHEMA_VERSION:
             await self._backup(f"schema-v{version}")
-            for table in ALL_TABLES:
-                await self.conn.execute(f"DROP TABLE IF EXISTS {table}")
+            if all(v in MIGRATIONS for v in range(version, SCHEMA_VERSION)):
+                for v in range(version, SCHEMA_VERSION):
+                    for sql in MIGRATIONS[v]:
+                        await self.conn.execute(sql)
+                log.info("database migrated from v%s to v%s", version, SCHEMA_VERSION)
+                self.migrated_from = version
+            else:
+                for table in ALL_TABLES:
+                    await self.conn.execute(f"DROP TABLE IF EXISTS {table}")
         await self.conn.executescript(SCHEMA)
         await self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         await self.conn.commit()
@@ -292,6 +362,9 @@ class Database:
             raise ValueError(flag)
         await self._exec(f"UPDATE games SET {flag} = ? WHERE chat_id = ?", (int(value), chat_id))
 
+    async def set_history(self, chat_id: int, history: str) -> None:
+        await self._exec("UPDATE games SET history = ? WHERE chat_id = ?", (history, chat_id))
+
     async def advance_turn(self, chat_id: int) -> None:
         await self._exec("UPDATE games SET turn = turn + 1 WHERE chat_id = ?", (chat_id,))
 
@@ -321,6 +394,9 @@ class Database:
             (user_id, player_name, *stats.values(), profile["government"], profile["leader_title"],
              profile["description"], country_id),
         )
+
+    async def set_notes(self, country_id: int, notes: str) -> None:
+        await self._exec("UPDATE countries SET notes = ? WHERE id = ?", (notes[:3000], country_id))
 
     async def release_player(self, country_id: int) -> None:
         await self._exec("UPDATE countries SET user_id = NULL, player_name = NULL WHERE id = ?", (country_id,))
@@ -617,6 +693,96 @@ class Database:
         """Games stored under a basic-group id (supergroups are <= -100xxxxxxxxxx) that may have been migrated."""
         rows = await self._all("SELECT chat_id FROM games WHERE chat_id < 0 AND chat_id > -1000000000000")
         return [r["chat_id"] for r in rows]
+
+    # NPC memory
+    async def remember(self, chat_id: int, turn: int, npc_id: int, other_id: int | None, kind: str, speaker: str,
+                       text: str, private: bool = False) -> None:
+        await self._exec(
+            "INSERT INTO memory (chat_id, turn, npc_id, other_id, kind, private, speaker, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, turn, npc_id, other_id, kind, int(private), speaker, text[:2000]),
+        )
+
+    async def recall(self, chat_id: int, npc_id: int, other_id: int | None = None, limit: int = 20,
+                     public_only: bool = False) -> list[dict]:
+        sql = "SELECT turn, kind, private, speaker, text FROM memory WHERE chat_id = ? AND npc_id = ?"
+        params: list = [chat_id, npc_id]
+        if other_id is not None:
+            sql += " AND other_id = ?"
+            params.append(other_id)
+        if public_only:
+            sql += " AND private = 0"
+        rows = await self._all(sql + " ORDER BY id DESC LIMIT ?", (*params, limit))
+        return list(reversed(rows))
+
+    # supports
+    async def add_support(self, chat_id: int, turn: int, from_id: int, to_id: int, kind: str, amount: float,
+                          note: str, secret: bool, turns_left: int) -> int:
+        return await self._exec(
+            "INSERT INTO supports (chat_id, turn, from_id, to_id, kind, amount, note, secret, turns_left) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, turn, from_id, to_id, kind, amount, note, int(secret), turns_left),
+        )
+
+    async def supports_for_turn(self, chat_id: int, turn: int) -> list[dict]:
+        return await self._all("SELECT * FROM supports WHERE chat_id = ? AND (turn = ? OR turns_left > 0) ORDER BY id",
+                               (chat_id, turn))
+
+    async def active_supports(self, chat_id: int) -> list[dict]:
+        return await self._all("SELECT * FROM supports WHERE chat_id = ? AND turns_left > 0", (chat_id,))
+
+    async def tick_supports(self, chat_id: int) -> None:
+        await self._exec("UPDATE supports SET turns_left = turns_left - 1 WHERE chat_id = ? AND turns_left > 0", (chat_id,))
+
+    async def all_supports(self, chat_id: int) -> list[dict]:
+        return await self._all("SELECT * FROM supports WHERE chat_id = ? ORDER BY id", (chat_id,))
+
+    # alliances
+    async def create_alliance(self, chat_id: int, name: str, charter: str, leader_id: int, turn: int) -> int:
+        aid = await self._exec(
+            "INSERT INTO alliances (chat_id, name, charter, leader_id, created_turn) VALUES (?, ?, ?, ?, ?)",
+            (chat_id, name, charter, leader_id, turn),
+        )
+        await self._exec("INSERT INTO alliance_members (alliance_id, country_id, joined_turn) VALUES (?, ?, ?)",
+                         (aid, leader_id, turn))
+        return aid
+
+    async def get_alliance(self, alliance_id: int) -> dict | None:
+        return await self._one("SELECT * FROM alliances WHERE id = ?", (alliance_id,))
+
+    async def list_alliances(self, chat_id: int) -> list[dict]:
+        return await self._all("SELECT * FROM alliances WHERE chat_id = ? AND status = 'active' ORDER BY id", (chat_id,))
+
+    async def alliance_of(self, chat_id: int, country_id: int) -> dict | None:
+        return await self._one(
+            "SELECT a.* FROM alliances a JOIN alliance_members m ON m.alliance_id = a.id "
+            "WHERE a.chat_id = ? AND a.status = 'active' AND m.country_id = ?", (chat_id, country_id))
+
+    async def alliance_members(self, alliance_id: int) -> list[int]:
+        rows = await self._all("SELECT country_id FROM alliance_members WHERE alliance_id = ? ORDER BY joined_turn, rowid",
+                               (alliance_id,))
+        return [r["country_id"] for r in rows]
+
+    async def add_alliance_member(self, alliance_id: int, country_id: int, turn: int) -> None:
+        await self._exec("INSERT OR IGNORE INTO alliance_members (alliance_id, country_id, joined_turn) VALUES (?, ?, ?)",
+                         (alliance_id, country_id, turn))
+
+    async def remove_alliance_member(self, alliance_id: int, country_id: int) -> None:
+        await self._exec("DELETE FROM alliance_members WHERE alliance_id = ? AND country_id = ?", (alliance_id, country_id))
+
+    async def update_alliance(self, alliance_id: int, **fields) -> None:
+        keys = [k for k in fields if k in ("leader_id", "status", "name", "charter")]
+        await self._exec(f"UPDATE alliances SET {', '.join(f'{k} = ?' for k in keys)} WHERE id = ?",
+                         (*(fields[k] for k in keys), alliance_id))
+
+    async def add_alliance_request(self, alliance_id: int, country_id: int, kind: str) -> int:
+        return await self._exec("INSERT INTO alliance_requests (alliance_id, country_id, kind) VALUES (?, ?, ?)",
+                                (alliance_id, country_id, kind))
+
+    async def get_alliance_request(self, request_id: int) -> dict | None:
+        return await self._one("SELECT * FROM alliance_requests WHERE id = ?", (request_id,))
+
+    async def set_alliance_request(self, request_id: int, status: str) -> None:
+        await self._exec("UPDATE alliance_requests SET status = ? WHERE id = ?", (status, request_id))
 
     # user prefs
     async def set_active_chat(self, user_id: int, chat_id: int) -> None:

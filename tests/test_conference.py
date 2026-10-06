@@ -152,3 +152,19 @@ async def test_schema_change_keeps_backup(tmp_path):
     await database.connect()
     await database.close()
     assert len(glob.glob(f"{path}.*.bak")) == 1
+
+
+async def test_partial_signing_drops_terms_of_non_signers(db):
+    ukr, rus, tur, occupied, conf = await setup_conference(db)
+    terms = empty_terms(
+        peace=[{"a_id": ukr["id"], "b_id": rus["id"], "mode": "status_quo"}],
+        payments=[{"from_id": tur["id"], "to_id": ukr["id"], "amount_bn": 3, "purpose": "кредит"}],
+        clauses=["Обмен пленными"],
+    )
+    tur_budget = (await db.get_country(tur["id"]))["budget"]
+    effects = await execute_terms(db, conf, terms, parties={ukr["id"], rus["id"]})
+    assert (await db.get_relation(CHAT, ukr["id"], rus["id"]))["status"] == "peace"
+    assert (await db.get_country(tur["id"]))["budget"] == tur_budget
+    assert not any("кредит" in e for e in effects)
+    assert await db.list_actions(CHAT, 1, tur["id"]) == []
+    assert "Обмен пленными" in (await db.list_actions(CHAT, 1, ukr["id"]))[-1]["text"]

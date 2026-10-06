@@ -10,6 +10,8 @@ from bot.geo import World, load_world
 from bot.mapdraw import MapView
 from bot.seed import initial_cells, initial_countries
 from bot.stats import STAT_KEYS, apply_deltas, power_index
+from bot.alliance import snapshot as alliances_snapshot
+from bot.support import KINDS as SUPPORT_KINDS, give_support, support_bonus
 from bot.war import apply_peace, army_power, attack_targets, max_attacks, resolve_operations
 
 log = logging.getLogger(__name__)
@@ -24,6 +26,9 @@ ACTION_KINDS = {
     "treaty": "подписанный договор",
     "npc_deal": "договор со страной-НИП",
 }
+
+PEACE_WORDS = ("мир", "перемир", "прекращ", "огня", "ceasefire", "peace", "капитул")
+ALLIANCE_WORDS = ("союз", "альянс", "alliance", "коалиц")
 
 COLLAPSE_STABILITY = 5
 MAX_GENERALS = 4
@@ -49,6 +54,7 @@ class TurnOutcome:
     collapses: list[str] = field(default_factory=list)
     eliminated: list[dict] = field(default_factory=list)
     npc_messages: list[tuple[dict, str]] = field(default_factory=list)
+    support_lines: list[str] = field(default_factory=list)
     event_lines: list[str] = field(default_factory=list)
 
 
@@ -132,6 +138,14 @@ async def world_snapshot(db: Database, chat_id: int, extra_ids: set[int] | None 
         if r["a_id"] in by_id and r["b_id"] in by_id and (r["a_id"] in relevant or r["b_id"] in relevant)
     ]
     history = [{"turn": h["turn"], "headline": h["headline"], "event": h["event"]} for h in await db.recent_chronicle(chat_id)]
+    npc_notes = {by_id[cid]["name"]: by_id[cid]["notes"] for cid in sorted(relevant)
+                 if not by_id[cid]["user_id"] and by_id[cid].get("notes")}
+    supports = [
+        {"from": by_id[x["from_id"]]["name"], "to": by_id[x["to_id"]]["name"], "kind": x["kind"], "amount_bn": x["amount"],
+         "secret": bool(x["secret"]), "note": x["note"], "turns_left": x["turns_left"]}
+        for x in await db.supports_for_turn(chat_id, game["turn"] if game else 1)
+        if x["from_id"] in by_id and x["to_id"] in by_id
+    ]
     agreements = [
         {**a, "parties": [by_id[pid]["name"] for pid in a["parties"] if pid in by_id]}
         for a in await db.signed_agreements(chat_id)
@@ -147,8 +161,12 @@ async def world_snapshot(db: Database, chat_id: int, extra_ids: set[int] | None 
              "severity": e["severity"], "affected_country_ids": e["affected"], "since_turn": e["started_turn"]}
             for e in events
         ],
+        "chronicle_summary": (game or {}).get("history") or "",
         "recent_history": history,
         "agreements_in_force": agreements,
+        "npc_notes": npc_notes,
+        "supports": supports,
+        "alliances": await alliances_snapshot(db, chat_id),
     }
 
 
@@ -223,6 +241,10 @@ async def run_war_phase(db: Database, gm: GameMaster, chat_id: int, actions: lis
     if not wars:
         return {}, [], {}, []
     owner, core = await db.cell_owners(chat_id)
+    bonus = support_bonus(await db.active_supports(chat_id), {cid: c["military"] for cid, c in countries.items()})
+    for cid, b in bonus.items():
+        if cid in countries:
+            countries[cid] = {**countries[cid], "support_bonus": b}
     generals = await db.list_generals(chat_id)
     briefs = war_briefs(world, owner, core, countries, wars, generals, actions)
     try:
@@ -351,6 +373,10 @@ async def resolve_turn(db: Database, gm: GameMaster, chat_id: int, rng: random.R
                 line += " 🕵️ Раскрыта тайная операция!"
             outcome.public_lines.append(line)
             report = entry["private_report"]
+            marks = {"success": "✅", "partial": "🟡", "failure": "❌"}
+            if entry.get("orders"):
+                report += "\n\n📋 Итоги приказов:\n" + "\n".join(
+                    f"{marks.get(o['outcome'], '•')} {o['order']} — {o['result']}" for o in entry["orders"])
             if general_reports.get(country["id"]):
                 report += "\n\n🎖 Доклады генералов:\n" + "\n".join(f"— {r}" for r in general_reports[country["id"]])
             outcome.private_reports[country["id"]] = report
@@ -363,7 +389,30 @@ async def resolve_turn(db: Database, gm: GameMaster, chat_id: int, rng: random.R
     for rel in result["relations"]:
         a, b = rel["a_id"], rel["b_id"]
         if a in by_id and b in by_id and a != b:
-            await db.change_relation(chat_id, a, b, int(rel["delta"]), rel["status"])
+            old = await db.get_relation(chat_id, a, b)
+            status = rel["status"]
+            if (status == "war") != (old["status"] == "war"):
+                status = old["status"]  # only players' orders and signed treaties start or end wars
+            await db.change_relation(chat_id, a, b, max(-20, min(20, int(rel["delta"]))), status)
+
+    for note in result.get("npc_notes", []):
+        c = by_id.get(note["country_id"])
+        if c and not c["user_id"]:
+            await db.set_notes(c["id"], note["notes"])
+
+    for sup in result.get("npc_support", [])[:5]:
+        giver, receiver = by_id.get(sup["from_id"]), by_id.get(sup["to_id"])
+        if not giver or not receiver or giver["user_id"] or sup["kind"] not in SUPPORT_KINDS:
+            continue
+        giver, receiver = await db.get_country(giver["id"]), await db.get_country(receiver["id"])
+        ok, effect = await give_support(db, chat_id, turn, giver, receiver, sup["kind"], sup["amount_bn"],
+                                        sup["reason"], secret=sup["kind"] == "intel")
+        if ok:
+            await db.remember(chat_id, turn, giver["id"], receiver["id"], "support", giver["name"],
+                              f"Оказали поддержку ({sup['kind']}, {sup['amount_bn']} млрд $): {sup['reason']}")
+            if sup["kind"] != "intel":
+                outcome.support_lines.append(f"{giver['flag']} {giver['name']} → {receiver['flag']} {receiver['name']}: "
+                                             f"{SUPPORT_KINDS[sup['kind']]} — {effect}")
 
     active = {e["id"]: e for e in await db.active_events(chat_id)}
     for ev in result["events"]:
@@ -383,6 +432,9 @@ async def resolve_turn(db: Database, gm: GameMaster, chat_id: int, rng: random.R
             if c and not c["user_id"]:
                 outcome.npc_messages.append((c, msg["text"]))
 
+    if result.get("chronicle_summary"):
+        await db.set_history(chat_id, result["chronicle_summary"][:4000])
+    await db.tick_supports(chat_id)
     await db.add_chronicle(chat_id, turn, outcome.headline, outcome.world_news, outcome.world_event)
     await db.advance_turn(chat_id)
     return outcome
@@ -404,7 +456,47 @@ async def fix_capital(db: Database, world: World, chat_id: int, country: dict, o
     return True
 
 
-async def apply_treaty(db: Database, treaty: dict) -> list[str]:
+async def end_war(db: Database, chat_id: int, a: int, b: int, status: str = "peace", delta: int = 10) -> None:
+    await db.change_relation(chat_id, a, b, delta, status)
+    for g in await db.list_generals(chat_id):
+        if (g["country_id"], g["target_id"]) in ((a, b), (b, a)):
+            await db.update_general(g["id"], target_id=None)
+
+
+async def treaty_effects(gm: GameMaster | None, text: str, a: dict, b: dict, status: str) -> dict:
+    if gm is not None:
+        try:
+            return await gm.interpret_treaty(text, a, b, status)
+        except AIError:
+            pass
+    t = text.casefold()
+    return {"ends_war": any(w in t for w in PEACE_WORDS), "alliance": any(w in t for w in ALLIANCE_WORDS),
+            "non_aggression": "ненапад" in t, "summary": text[:200]}
+
+
+async def repair_signed_peace(db: Database) -> list[tuple[int, int, int]]:
+    """One-off fix for games from older versions, where a signed peace treaty did not end the war."""
+    fixed = []
+    for t in await db._all("SELECT * FROM treaties WHERE status = 'signed' AND kind = 'general'"):
+        text = t["text"].casefold()
+        if not any(w in text for w in PEACE_WORDS):
+            continue
+        chat_id, a, b = t["chat_id"], t["a_id"], t["b_id"]
+        if (await db.get_relation(chat_id, a, b))["status"] != "war":
+            continue
+        ca, cb = await db.get_country(a), await db.get_country(b)
+        redeclared = await db._all(
+            "SELECT 1 FROM actions WHERE chat_id = ? AND kind = 'war' AND turn > ? AND "
+            "((country_id = ? AND target = ?) OR (country_id = ? AND target = ?))",
+            (chat_id, t["turn"], a, cb["name"], b, ca["name"]),
+        )
+        if not redeclared:
+            await end_war(db, chat_id, a, b, "peace", 10)
+            fixed.append((chat_id, a, b))
+    return fixed
+
+
+async def apply_treaty(db: Database, treaty: dict, gm: GameMaster | None = None) -> list[str]:
     """Execute a treaty signed by both sides. Returns human-readable effects."""
     world = load_world()
     chat_id, a, b = treaty["chat_id"], treaty["a_id"], treaty["b_id"]
@@ -434,8 +526,17 @@ async def apply_treaty(db: Database, treaty: dict) -> list[str]:
         effects.append("🗺 Переданы провинции: " + (", ".join(moved) if moved else "нет (уже сменили владельца)"))
         await db.change_relation(chat_id, a, b, 5)
     else:
-        await db.change_relation(chat_id, a, b, 15)
-        effects.append("🤝 Договор вступил в силу.")
+        rel = await db.get_relation(chat_id, a, b)
+        fx = await treaty_effects(gm, treaty["text"], ca, cb, rel["status"])
+        if fx["alliance"]:
+            await end_war(db, chat_id, a, b, "alliance", 20)
+            effects.append("🤝 Заключён союз." + (" Война окончена." if rel["status"] == "war" else ""))
+        elif fx["ends_war"] and rel["status"] == "war":
+            await end_war(db, chat_id, a, b, "peace", 10)
+            effects.append("🕊 Война окончена: армии остаются на текущей линии разграничения.")
+        else:
+            await db.change_relation(chat_id, a, b, 15, "peace" if fx["non_aggression"] and rel["status"] == "tension" else None)
+            effects.append("🤝 Договор вступил в силу.")
 
     for c in (ca, cb):
         if c and not await fix_capital(db, world, chat_id, await db.get_country(c["id"]), owner, core):
@@ -443,6 +544,50 @@ async def apply_treaty(db: Database, treaty: dict) -> list[str]:
     for cid, partner in ((a, cb["name"]), (b, ca["name"])):
         await db.add_action(chat_id, game["turn"], cid, "treaty", treaty["text"], partner)
     return effects
+
+
+async def npc_context(db: Database, chat_id: int, npc: dict, other: dict) -> dict:
+    """Everything an AI-run country should remember when talking to `other`."""
+    world = await world_snapshot(db, chat_id, extra_ids={npc["id"], other["id"]})
+    rel = await db.get_relation(chat_id, npc["id"], other["id"])
+    return {
+        "you": npc["name"],
+        "talking_to": other["name"],
+        "your_notes": npc.get("notes") or "",
+        "relation_with_them": {"status": rel["status"], "trust": rel["value"]},
+        "conversation": [{"turn": m["turn"], "who": m["speaker"], "text": m["text"], "secret": bool(m["private"])}
+                         for m in await db.recall(chat_id, npc["id"], other["id"], limit=24)],
+        "your_recent_contacts": [{"turn": m["turn"], "who": m["speaker"], "text": m["text"][:300]}
+                                 for m in await db.recall(chat_id, npc["id"], limit=12)],
+        "agreements_with_them": [a for a in world["agreements_in_force"] if {npc["name"], other["name"]} <= set(a["parties"])],
+        "world": world,
+    }
+
+
+async def npc_answer(db: Database, gm: GameMaster, chat_id: int, npc: dict, speaker: dict, text: str,
+                     *, private: bool) -> tuple[str, str | None]:
+    """Ask an AI-run country to reply with memory; store the exchange, notes, trust and any support it gives."""
+    game = await db.get_game(chat_id)
+    turn = game["turn"]
+    context = await npc_context(db, chat_id, npc, speaker)
+    answer = await gm.npc_respond(npc, speaker, text, context, private=private)
+    kind = "talk" if private else "say"
+    await db.remember(chat_id, turn, npc["id"], speaker["id"], kind, speaker["name"], text, private)
+    await db.remember(chat_id, turn, npc["id"], speaker["id"], kind, npc["name"], answer["reply"], private)
+    await db.set_notes(npc["id"], answer["notes"])
+    trust = max(-15, min(15, int(answer["trust_delta"])))
+    if trust:
+        await db.change_relation(chat_id, npc["id"], speaker["id"], trust)
+    support_text = None
+    sup = answer["support"]
+    if sup["kind"] in SUPPORT_KINDS:
+        giver, receiver = await db.get_country(npc["id"]), await db.get_country(speaker["id"])
+        ok, effect = await give_support(db, chat_id, turn, giver, receiver, sup["kind"], sup["amount_bn"],
+                                        f"по итогам переговоров: {text[:200]}", secret=private)
+        if ok:
+            support_text = f"{SUPPORT_KINDS[sup['kind']]}" + (f" ({sup['amount_bn']:g} млрд $)" if sup["amount_bn"] else "") + f": {effect}"
+            await db.remember(chat_id, turn, npc["id"], speaker["id"], "support", npc["name"], f"Оказали поддержку: {support_text}", private)
+    return answer["reply"], support_text
 
 
 async def map_view(db: Database, chat_id: int, title: str) -> MapView:

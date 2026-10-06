@@ -1,5 +1,5 @@
+import asyncio
 import logging
-import time
 from html import escape
 
 from aiogram import Bot, F, Router
@@ -21,7 +21,8 @@ router = Router()
 
 MAX_PARTIES = 8
 ROOM_TITLE = "🏛 Комната переговоров"
-_npc_last: dict[tuple[int, int], float] = {}
+_talk_locks: dict[int, asyncio.Lock] = {}
+_talk_pending: set[int] = set()
 
 TG_ERRORS = (TelegramBadRequest, TelegramForbiddenError)
 
@@ -258,9 +259,9 @@ async def cmd_conference(message: Message, command: CommandObject, bot: Bot, db:
         for c in parties.values())
     await room_say(bot, db, conf_id, room["room_chat_id"],
                    f"🕊 <b>Конференция №{conf_id}</b>\nТема: {escape(topic)}\n\n<b>Участники:</b>\n{roster}\n\n"
-                   "Ведите переговоры обычными сообщениями. Делегации ИИ отвечают, когда к ним обращаются по названию страны.\n"
+                   "Ведите переговоры обычными сообщениями. Делегации ИИ сами понимают, к кому вы обращаетесь, и отвечают (один на один — на каждое сообщение).\n"
                    "Когда договоритесь — /draft: ИИ проанализирует переговоры и составит договор.\n"
-                   "Закрыть без соглашения — /endconf.")
+                   "Если кто-то не подпишет — инициатор может заключить договор между подписавшими.\nЗакрыть без соглашения — /endconf.")
 
     kb = InlineKeyboardBuilder()
     kb.button(text="🚪 Войти в зал переговоров", url=link.invite_link)
@@ -332,28 +333,46 @@ async def cmd_draft(message: Message, bot: Bot, db: Database, gm: GameMaster):
     npc_ok = {pos["country_id"]: pos["accepts"] for pos in terms["npc_positions"]}
     for p in people:
         if not p["user_id"]:
-            await db.set_member(conf["id"], p["id"], signed=int(npc_ok.get(p["id"], False)))
+            await db.set_member(conf["id"], p["id"], signed=1 if npc_ok.get(p["id"], False) else -1)
     names = {p["id"]: p["name"] for p in people}
     await room_say(bot, db, conf["id"], message.chat.id, render_terms(terms, names))
-    await room_say(bot, db, conf["id"], message.chat.id, await _signature_status(db, conf["id"], version),
-                   reply_markup=_sign_kb(conf["id"], version))
+    status_text, partial = await _signature_status(db, conf["id"], version)
+    await room_say(bot, db, conf["id"], message.chat.id, status_text, reply_markup=_sign_kb(conf["id"], version, partial))
 
 
-def _sign_kb(conf_id: int, version: int):
+def _sign_kb(conf_id: int, version: int, allow_partial: bool = False):
     kb = InlineKeyboardBuilder()
     kb.button(text="✍️ Подписать", callback_data=f"cf:{conf_id}:{version}:sign")
     kb.button(text="✋ Отказаться", callback_data=f"cf:{conf_id}:{version}:no")
+    if allow_partial:
+        kb.button(text="📜 Заключить между подписавшими", callback_data=f"cf:{conf_id}:{version}:partial")
+    kb.adjust(2, 1)
     return kb.as_markup()
 
 
-async def _signature_status(db: Database, conf_id: int, version: int) -> str:
+async def _signature_status(db: Database, conf_id: int, version: int) -> tuple[str, bool]:
     lines = [f"✍️ <b>Подписи под проектом v{version}</b>"]
-    for m in await db.conference_members(conf_id):
+    members = await db.conference_members(conf_id)
+    for m in members:
         c = await db.get_country(m["country_id"])
         who = "" if m["user_id"] else " (ИИ)"
-        lines.append(f"{'✅' if m['signed'] else '⌛'} {c['flag']} {escape(c['name'])}{who}")
+        mark = {1: "✅", -1: "❌"}.get(m["signed"], "⌛")
+        lines.append(f"{mark} {c['flag']} {escape(c['name'])}{who}")
+    signed = sum(1 for m in members if m["signed"] == 1)
+    partial = 2 <= signed < len(members)
     lines.append("\nДоговор вступит в силу, когда подпишут все. Чтобы изменить условия — продолжайте переговоры и снова /draft.")
-    return "\n".join(lines)
+    if partial:
+        lines.append("Не ждать остальных: инициатор может «📜 Заключить между подписавшими» — пункты, касающиеся "
+                     "неподписавших, отпадут.")
+    return "\n".join(lines), partial
+
+
+async def _refresh_status(call: CallbackQuery, db: Database, conf: dict) -> None:
+    text, partial = await _signature_status(db, conf["id"], conf["draft_version"])
+    try:
+        await call.message.edit_text(text, reply_markup=_sign_kb(conf["id"], conf["draft_version"], partial))
+    except TG_ERRORS:
+        pass
 
 
 @router.callback_query(F.data.startswith("cf:"))
@@ -366,41 +385,67 @@ async def cb_sign(call: CallbackQuery, bot: Bot, db: Database, settings: Setting
     if int(version) != conf["draft_version"]:
         await call.answer("Это устаревший проект — подпишите последний", show_alert=True)
         return
-    member = next((m for m in await db.conference_members(conf["id"]) if m["user_id"] == call.from_user.id), None)
+    members = await db.conference_members(conf["id"])
+    member = next((m for m in members if m["user_id"] == call.from_user.id), None)
     if not member:
         await call.answer("Подписывают только лидеры стран-участниц", show_alert=True)
         return
     country = await db.get_country(member["country_id"])
+
+    if action == "partial":
+        if member["country_id"] != conf["initiator_id"]:
+            await call.answer("Заключить договор без остальных может только инициатор конференции", show_alert=True)
+            return
+        signers = {m["country_id"] for m in members if m["signed"] == 1}
+        if len(signers) < 2:
+            await call.answer("Нужно хотя бы две подписи", show_alert=True)
+            return
+        await call.answer("Договор заключается между подписавшими")
+        await _finalize(bot, db, conf, signers)
+        return
+
     if action == "no":
-        await db.set_member(conf["id"], member["country_id"], signed=0)
+        await db.set_member(conf["id"], member["country_id"], signed=-1)
         await call.answer("Вы отказались подписывать")
         await room_say(bot, db, conf["id"], conf["room_chat_id"],
                        f"✋ {country['flag']} {escape(country['name'])} отказывается подписывать этот проект.")
+        await _refresh_status(call, db, conf)
         return
+
     await db.set_member(conf["id"], member["country_id"], signed=1)
     await call.answer("Подпись поставлена")
     members = await db.conference_members(conf["id"])
-    if not all(m["signed"] for m in members):
-        try:
-            await call.message.edit_text(await _signature_status(db, conf["id"], conf["draft_version"]),
-                                         reply_markup=_sign_kb(conf["id"], conf["draft_version"]))
-        except TG_ERRORS:
-            pass
-        return
+    if all(m["signed"] == 1 for m in members):
+        await _finalize(bot, db, conf, None)
+    else:
+        await _refresh_status(call, db, conf)
 
-    effects = await execute_terms(db, conf, conf["draft"])
+
+async def _finalize(bot: Bot, db: Database, conf: dict, signers: set[int] | None) -> None:
+    """Execute the treaty (for everyone, or only between `signers`), announce it and free the room."""
+    effects = await execute_terms(db, conf, conf["draft"], signers)
     people = await participants(db, conf["id"])
-    names = {p["id"]: p["name"] for p in people}
+    parties = [p for p in people if signers is None or p["id"] in signers]
+    left_out = [p for p in people if signers is not None and p["id"] not in signers]
+    game = await db.get_game(conf["chat_id"])
     terms = conf["draft"]
-    summary = (f"🎉 <b>Договор подписан всеми сторонами!</b>\n\n<b>{escape(terms['title'])}</b>\n{escape(terms['summary'])}"
+    record = f"Подписали «{terms['title']}»: {terms['summary']} Условия: " + "; ".join(terms["clauses"])
+    for npc in (p for p in parties if not p["user_id"]):
+        for other in (p for p in parties if p["id"] != npc["id"]):
+            await db.remember(conf["chat_id"], game["turn"], npc["id"], other["id"], "treaty", "конференция", record)
+    head = "🎉 <b>Договор подписан всеми сторонами!</b>" if not left_out else (
+        "📜 <b>Договор заключён между подписавшими:</b> " + ", ".join(f"{p['flag']} {escape(p['name'])}" for p in parties)
+        + "\n<i>Не подписали (пункты с их участием отпали): "
+        + ", ".join(f"{p['flag']} {escape(p['name'])}" for p in left_out) + "</i>")
+    summary = (f"{head}\n\n<b>{escape(terms['title'])}</b>\n{escape(terms['summary'])}"
                "\n\n<b>Исполнено:</b>\n" + ("\n".join(f"• {escape(e)}" for e in effects) or "• условия приняты к исполнению"))
     if terms["clauses"]:
         summary += "\n\n<b>Обязательства сторон:</b>\n" + "\n".join(f"• {escape(c)}" for c in terms["clauses"])
-    flags = " ".join(p["flag"] for p in people)
+    flags = " ".join(p["flag"] for p in parties)
     await bot.send_message(conf["chat_id"], f"🕊 {flags} <b>Итоги конференции №{conf['id']}</b>\n\n" + summary)
     for p in people:
         if p["user_id"]:
-            await send_dm(bot, p["user_id"], f"📜 Конференция №{conf['id']} завершена, договор вступил в силу.\n\n{summary}")
+            await send_dm(bot, p["user_id"], f"📜 Конференция №{conf['id']} завершена.\n\n{summary}")
     await close_room(bot, db, {**conf, "status": "signed"})
 
 
@@ -435,7 +480,7 @@ async def cmd_endconf(message: Message, bot: Bot, db: Database):
 # --- talks in the room ------------------------------------------------------
 
 @router.message(F.chat.type.in_({"group", "supergroup"}), F.text, ~F.text.startswith("/"))
-async def on_room_message(message: Message, bot: Bot, db: Database, gm: GameMaster, settings: Settings):
+async def on_room_message(message: Message, bot: Bot, db: Database, gm: GameMaster):
     conf = await _room_conference(message, db)
     if not conf:
         return
@@ -443,24 +488,46 @@ async def on_room_message(message: Message, bot: Bot, db: Database, gm: GameMast
     speaker = next((p for p in people if p["user_id"] == message.from_user.id), None)
     if not speaker:
         return
-    text = message.text[:2000]
     await db.log_conference(conf["id"], message.message_id, "player", speaker["id"],
-                            f"{speaker['name']} ({speaker['player_name']})", text)
+                            f"{speaker['name']} ({speaker['player_name']})", message.text[:2000])
+    if not any(not p["user_id"] for p in people):
+        return
+    # One AI round at a time per conference; messages that arrive meanwhile are answered in one follow-up round.
+    lock = _talk_locks.setdefault(conf["id"], asyncio.Lock())
+    if lock.locked():
+        _talk_pending.add(conf["id"])
+        return
+    async with lock:
+        while True:
+            _talk_pending.discard(conf["id"])
+            await _delegations_reply(bot, db, gm, conf, speaker)
+            if conf["id"] not in _talk_pending:
+                break
 
-    lowered = text.casefold()
-    for npc in (p for p in people if not p["user_id"]):
-        stem = npc["name"].casefold()[: max(4, len(npc["name"]) - 2)]
-        replied_to_npc = bool(message.reply_to_message and message.reply_to_message.text
-                              and message.reply_to_message.text.startswith(f"{npc['flag']} {npc['name']}"))
-        if stem not in lowered and not replied_to_npc:
+
+async def _delegations_reply(bot: Bot, db: Database, gm: GameMaster, conf: dict, speaker: dict) -> None:
+    conf = await db.get_conference(conf["id"])
+    if not conf or conf["status"] != "open":
+        return
+    people = await participants(db, conf["id"])
+    npcs = {p["id"]: p for p in people if not p["user_id"]}
+    game = await db.get_game(conf["chat_id"])
+    delegations = [
+        {"country_id": n["id"], "name": n["name"], "your_notes": n.get("notes") or "",
+         "memory_of_speaker": await db.recall(conf["chat_id"], n["id"], speaker["id"], limit=10)}
+        for n in npcs.values()
+    ]
+    try:
+        replies = await gm.conference_npc_turn(await conference_context(db, conf), delegations, speaker["name"])
+    except AIError:
+        return
+    last_text = next((line["text"] for line in reversed((await conference_context(db, conf))["transcript"])
+                      if line["country_id"] == speaker["id"]), "")
+    for r in replies:
+        npc = npcs.get(r["country_id"])
+        if not npc or not r["reply"].strip():
             continue
-        key = (conf["id"], npc["id"])
-        if time.monotonic() - _npc_last.get(key, 0) < settings.conference_npc_cooldown_sec:
-            continue
-        _npc_last[key] = time.monotonic()
-        try:
-            reply = await gm.conference_npc_reply(npc, await conference_context(db, conf))
-        except AIError:
-            continue
-        await room_say(bot, db, conf["id"], message.chat.id, f"{npc['flag']} {escape(npc['name'])}: {escape(reply)}",
-                       kind="npc", country_id=npc["id"], speaker=f"{npc['name']} (делегация ИИ)", log_text=reply)
+        await db.remember(conf["chat_id"], game["turn"], npc["id"], speaker["id"], "conference", speaker["name"], last_text)
+        await db.remember(conf["chat_id"], game["turn"], npc["id"], speaker["id"], "conference", npc["name"], r["reply"])
+        await room_say(bot, db, conf["id"], conf["room_chat_id"], f"{npc['flag']} {escape(npc['name'])}: {escape(r['reply'])}",
+                       kind="npc", country_id=npc["id"], speaker=f"{npc['name']} (делегация ИИ)", log_text=r["reply"])

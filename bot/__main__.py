@@ -9,6 +9,7 @@ from aiogram.types import BotCommand
 from bot.ai import GameMaster
 from bot.config import load_settings
 from bot.db import Database
+from bot.game import repair_signed_peace
 from bot.geo import load_world
 from bot.llm import make_backend
 from bot.handlers import setup_routers
@@ -28,10 +29,15 @@ COMMANDS = [
     BotCommand(command="propose", description="Предложить договор"),
     BotCommand(command="peace", description="Мирный договор"),
     BotCommand(command="conference", description="Созвать мирную конференцию"),
+    BotCommand(command="alliance", description="Союзы: создать, вступить, пригласить"),
+    BotCommand(command="alliances", description="Все союзы мира"),
     BotCommand(command="draft", description="Составить договор (в зале конференции)"),
     BotCommand(command="transfer", description="Передать провинции"),
     BotCommand(command="demand", description="Потребовать провинции"),
     BotCommand(command="aid", description="Помощь стране"),
+    BotCommand(command="support", description="Поддержать страну (деньги, оружие, войска)"),
+    BotCommand(command="talk", description="Тайные переговоры (в ЛС)"),
+    BotCommand(command="export", description="Вся история игры файлом"),
     BotCommand(command="sanction", description="Ввести санкции"),
     BotCommand(command="war", description="Объявить войну"),
     BotCommand(command="generals", description="Мои генералы"),
@@ -56,6 +62,9 @@ async def main() -> None:
 
     db = Database(settings.db_path)
     await db.connect()
+    if db.migrated_from == 3:
+        for chat_id, a, b in await repair_signed_peace(db):
+            logging.info("ended war %s-%s in %s: peace treaty was signed before the update", a, b, chat_id)
     backend = make_backend(settings.ai_provider.lower(), settings.ai_model, settings.anthropic_api_key,
                            settings.openrouter_api_key)
     gm = GameMaster(backend)

@@ -2,16 +2,17 @@ import re
 from html import escape
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.ai import AIError, GameMaster
 from bot.db import Database
-from bot.game import apply_treaty, world_snapshot
+from bot.game import apply_treaty, npc_answer, npc_context
 from bot.geo import load_world
 from bot.handlers.actions import MAX_TEXT, parse_parts
-from bot.handlers.common import find_country, is_private, player_context
+from bot.handlers.common import find_country, is_private, player_context, send_dm
 
 router = Router()
 
@@ -62,18 +63,26 @@ async def _create_treaty(message: Message, bot: Bot, db: Database, gm: GameMaste
         return
 
     wait = await message.answer(f"📨 Послы отправились в {other['flag']} {escape(other['name'])}…")
+    description = _describe(treaty, me, other)
     try:
-        world = await world_snapshot(db, chat_id, extra_ids={me["id"], other["id"]})
-        answer = await gm.npc_diplomacy(me, other, _describe(treaty, me, other), world)
+        context = await npc_context(db, chat_id, other, me)
+        answer = await gm.npc_diplomacy(me, other, description, context)
     except AIError as e:
         await wait.edit_text(f"⚠️ {escape(str(e))}")
         await db.set_treaty_status(tid, "cancelled")
         return
     await wait.delete()
+    await db.set_notes(other["id"], answer["notes"])
+    trust = max(-15, min(15, int(answer["trust_delta"])))
+    if trust:
+        await db.change_relation(chat_id, other["id"], me["id"], trust)
+    await db.remember(chat_id, game["turn"], other["id"], me["id"], "treaty", me["name"], f"Предложили договор: {description}")
+    await db.remember(chat_id, game["turn"], other["id"], me["id"], "treaty", other["name"],
+                      ("Подписали. " if answer["accepted"] else "Отказали. ") + answer["reply"])
     if answer["accepted"]:
         await db.sign_treaty(tid, "b")
         await db.set_treaty_status(tid, "signed")
-        effects = await apply_treaty(db, await db.get_treaty(tid))
+        effects = await apply_treaty(db, await db.get_treaty(tid), gm)
         verdict = "🤝 <b>Подписано обеими сторонами!</b>\n" + "\n".join(escape(e) for e in effects)
     else:
         await db.set_treaty_status(tid, "rejected")
@@ -181,7 +190,7 @@ async def cmd_demand(message: Message, command: CommandObject, bot: Bot, db: Dat
 
 
 @router.callback_query(F.data.startswith("tr:"))
-async def cb_treaty(call: CallbackQuery, db: Database):
+async def cb_treaty(call: CallbackQuery, db: Database, gm: GameMaster):
     _, tid, action = call.data.split(":")
     treaty = await db.get_treaty(int(tid))
     if not treaty or treaty["status"] != "pending":
@@ -206,7 +215,7 @@ async def cb_treaty(call: CallbackQuery, db: Database):
     treaty = await db.get_treaty(treaty["id"])
     if treaty["signed_a"] and treaty["signed_b"]:
         await db.set_treaty_status(treaty["id"], "signed")
-        effects = await apply_treaty(db, treaty)
+        effects = await apply_treaty(db, treaty, gm)
         await call.message.edit_text(treaty_text(treaty, a, b) + "\n\n🤝 <b>Подписано обеими сторонами!</b>\n"
                                      + "\n".join(escape(e) for e in effects))
     else:
@@ -234,12 +243,54 @@ async def cmd_say(message: Message, command: CommandObject, bot: Bot, db: Databa
     if other["user_id"] or not game["npc_chat"]:
         return
     try:
-        world = await world_snapshot(db, game["chat_id"], extra_ids={me["id"], other["id"]})
-        reply = await gm.npc_say(other, me, text, world)
+        reply, support = await npc_answer(db, gm, game["chat_id"], other, me, text, private=False)
     except AIError:
         return
-    await bot.send_message(game["chat_id"], f"↩️ {other['flag']} <b>{escape(other['name'])}</b> → {me['flag']} "
-                                            f"<b>{escape(me['name'])}</b>:\n{escape(reply)}")
+    msg = (f"↩️ {other['flag']} <b>{escape(other['name'])}</b> → {me['flag']} <b>{escape(me['name'])}</b>:\n"
+           f"{escape(reply)}")
+    if support:
+        msg += f"\n\n📦 <b>Поддержка:</b> {escape(support)}"
+    await bot.send_message(game["chat_id"], msg)
+
+
+@router.message(Command("talk"))
+async def cmd_talk(message: Message, command: CommandObject, bot: Bot, db: Database, gm: GameMaster):
+    if not is_private(message):
+        try:
+            await message.delete()
+        except TelegramBadRequest:
+            pass
+        me = await bot.me()
+        await message.answer(f"🤫 Тайные переговоры ведутся в личке: @{me.username} — /talk <i>страна</i> | <i>текст</i>")
+        return
+    target, text = parse_parts(command.args)
+    if not target or not text:
+        await message.answer("Формат: /talk <i>страна</i> | <i>сообщение</i> — тайные переговоры. Другие игроки их не видят. "
+                             "Страна-ИИ запомнит разговор, обещания и может оказать поддержку.")
+        return
+    if len(text) > MAX_TEXT:
+        await message.answer(f"Слишком длинно — максимум {MAX_TEXT} символов.")
+        return
+    parties = await _parties(message, db, target)
+    if not parties:
+        return
+    game, me, other = parties
+    if other["user_id"]:
+        delivered = await send_dm(bot, other["user_id"], f"🔒 <b>Тайное послание от {me['flag']} {escape(me['name'])}</b>\n\n"
+                                                         f"{escape(text)}\n\nОтветить: <code>/talk {escape(me['name'])} | …</code>")
+        await message.answer("🔒 Послание доставлено." if delivered else
+                             "📭 Лидер этой страны ещё не открыл личку с ботом — послание не доставлено.")
+        return
+    await bot.send_chat_action(message.chat.id, "typing")
+    try:
+        reply, support = await npc_answer(db, gm, game["chat_id"], other, me, text, private=True)
+    except AIError as e:
+        await message.answer(f"⚠️ {escape(str(e))}")
+        return
+    msg = f"🔒 {other['flag']} <b>{escape(other['name'])}</b> (тайно):\n{escape(reply)}"
+    if support:
+        msg += f"\n\n📦 <b>Тайная поддержка:</b> {escape(support)}"
+    await message.answer(msg)
 
 
 def _resolution_text(author: dict, text: str, tally: dict) -> str:

@@ -124,12 +124,13 @@ def render_terms(terms: dict, names: dict[int, str]) -> str:
     return "\n".join(lines)
 
 
-async def execute_terms(db: Database, conf: dict, terms: dict) -> list[str]:
+async def execute_terms(db: Database, conf: dict, terms: dict, parties: set[int] | None = None) -> list[str]:
+    """Carry out the treaty. With `parties`, only terms between those signatories take effect."""
     world = load_world()
     chat_id = conf["chat_id"]
     game = await db.get_game(chat_id)
     people = {p["id"]: p for p in await participants(db, conf["id"])}
-    ids = set(people)
+    ids = set(people) if parties is None else set(people) & parties
     owner, core = await db.cell_owners(chat_id)
     terms = clean_terms(terms, ids, owner)
     name = lambda cid: people[cid]["name"]  # noqa: E731

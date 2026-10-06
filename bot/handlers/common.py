@@ -136,6 +136,8 @@ async def finish_turn(bot: Bot, db: Database, gm: GameMaster, settings: Settings
             parts += ["", f"🌐 <b>Главное событие:</b> {escape(outcome.world_event)}"]
         if outcome.war_lines:
             parts += ["", "<b>⚔️ Сводка с фронтов:</b>", *(f"• {escape(x)}" for x in outcome.war_lines)]
+        if outcome.support_lines:
+            parts += ["", "<b>📦 Поддержка стран:</b>", *(f"• {escape(x)}" for x in outcome.support_lines)]
         if outcome.event_lines:
             parts += ["", "<b>🌍 Мировые события:</b>", *(f"• {escape(x)}" for x in outcome.event_lines)]
         if outcome.public_lines:

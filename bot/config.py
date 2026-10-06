@@ -13,7 +13,6 @@ class Settings(BaseSettings):
     start_year: int = 2026
     max_actions_per_turn: int = 5
     advisor_cooldown_sec: int = 20
-    conference_npc_cooldown_sec: int = 20
 
 
 def load_settings() -> Settings:

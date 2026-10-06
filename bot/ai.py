@@ -26,6 +26,13 @@ GM_SYSTEM = """Ты — ведущий (гейм-мастер) текстово�
 - При очень низкой стабильности — протесты, забастовки, угроза переворота.
 - Мировые события (эпидемии, катастрофы, кризисы) длятся несколько ходов: распространяются на соседей, усиливаются или затухают. Карантин, медицина, технологии и международная помощь помогают с ними справиться.
 
+- КАЖДЫЙ приказ игрока обязан дать ощутимый, конкретный результат: отрази его в deltas (обычно ±2..10 по связанным показателям, траты из казны, рост/падение ВВП) и в orders. Удачная реформа — заметный плюс (возможно, с ценой: деньги, рейтинг), провальная — заметный минус. Нулевые deltas у страны, которая отдавала приказы, недопустимы.
+- Войну и мир между странами переключают только сами игроки (объявление войны, подписанный мир) — ты не меняешь статус war в relations.
+- Поддержка (supports): деньги, оружие, войска, разведка, гуманитарка уже применены движком — учитывай её в событиях и реакции мира.
+- У стран-НИП есть записные книжки (npc_notes): обещания, планы, доверие к игрокам. Действуй согласно им: выполняй обещанное, если это в интересах страны, или предавай, если доверие подорвано, — и обновляй записи.
+- Летопись (chronicle_summary) — память обо всей игре. Сверяйся с ней, чтобы не противоречить прошлому.
+- Союзы (alliances) — официальные блоки с главой. Союзники помогают друг другу, нападение на одного касается всех; страны-НИП в союзе следуют курсу главы, если это не идёт вразрез с их интересами.
+
 Стиль: живо, как сводка мировых СМИ, с конкретикой (цифры, ведомства, реакция рынков), без воды. Пиши по-русски.
 Не выдумывай действия за игроков. Если игрок ничего не сделал — страна дрейфует по инерции.
 """
@@ -70,8 +77,22 @@ TURN_SCHEMA = {
                         "description": "Секретный доклад для лидера страны: результаты всех его действий, включая тайные, и советы",
                     },
                     "secret_exposed": {"type": "boolean"},
+                    "orders": {
+                        "type": "array",
+                        "description": "Итог КАЖДОГО приказа этой страны за ход (включая тайные) в том же порядке",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "order": {"type": "string", "description": "Кратко, что приказано"},
+                                "result": {"type": "string", "description": "Что получилось, с цифрами, 1-2 предложения"},
+                                "outcome": {"type": "string", "enum": ["success", "partial", "failure"]},
+                            },
+                            "required": ["order", "result", "outcome"],
+                            "additionalProperties": False,
+                        },
+                    },
                 },
-                "required": ["country_id", "deltas", "public_summary", "private_report", "secret_exposed"],
+                "required": ["country_id", "deltas", "public_summary", "private_report", "secret_exposed", "orders"],
                 "additionalProperties": False,
             },
         },
@@ -108,6 +129,37 @@ TURN_SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        "chronicle_summary": {
+            "type": "string",
+            "description": "Обновлённая летопись всей игры с учётом этого хода: войны, договоры, союзы, ключевые реформы, "
+                           "кто кому что обещал. До 3000 символов, сжимай старое",
+        },
+        "npc_notes": {
+            "type": "array",
+            "description": "Обновлённые записные книжки стран-НИП, у которых что-то изменилось",
+            "items": {
+                "type": "object",
+                "properties": {"country_id": {"type": "integer"}, "notes": {"type": "string"}},
+                "required": ["country_id", "notes"],
+                "additionalProperties": False,
+            },
+        },
+        "npc_support": {
+            "type": "array",
+            "description": "Поддержка, которую страны-НИП решили оказать в этом ходу (по обещаниям или своим интересам)",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "from_id": {"type": "integer"},
+                    "to_id": {"type": "integer"},
+                    "kind": {"type": "string", "enum": ["money", "weapons", "troops", "intel", "humanitarian"]},
+                    "amount_bn": {"type": "number"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["from_id", "to_id", "kind", "amount_bn", "reason"],
+                "additionalProperties": False,
+            },
+        },
         "npc_messages": {
             "type": "array",
             "description": "Публичные заявления стран-НИП в общем чате",
@@ -119,7 +171,8 @@ TURN_SCHEMA = {
             },
         },
     },
-    "required": ["headline", "world_news", "world_event", "countries", "relations", "events", "npc_messages"],
+    "required": ["headline", "world_news", "world_event", "countries", "relations", "events", "npc_messages",
+                 "chronicle_summary", "npc_notes", "npc_support"],
     "additionalProperties": False,
 }
 
@@ -202,15 +255,66 @@ EVENT_SCHEMA = {
     "additionalProperties": False,
 }
 
+NOTES_FIELD = {
+    "type": "string",
+    "description": "Твоя обновлённая записная книжка (память страны): ключевые факты, договорённости и обещания "
+                   "(кто, что, к какому ходу), планы, доверие к каждому лидеру. До 1500 символов, сохраняй важное из старой",
+}
+TRUST_FIELD = {"type": "integer", "description": "Изменение доверия к собеседнику после этого разговора, от -15 до 15"}
+SUPPORT_FIELD = {
+    "type": "object",
+    "description": "Поддержка, которую страна решила оказать собеседнику прямо сейчас (kind = none, если нет)",
+    "properties": {
+        "kind": {"type": "string", "enum": ["none", "money", "weapons", "troops", "intel", "humanitarian"]},
+        "amount_bn": {"type": "number"},
+    },
+    "required": ["kind", "amount_bn"],
+    "additionalProperties": False,
+}
+
 NPC_SCHEMA = {
     "type": "object",
     "properties": {
         "accepted": {"type": "boolean"},
         "reply": {"type": "string", "description": "Официальный ответ МИД страны-НИП, 1-3 предложения"},
+        "notes": NOTES_FIELD,
+        "trust_delta": TRUST_FIELD,
     },
-    "required": ["accepted", "reply"],
+    "required": ["accepted", "reply", "notes", "trust_delta"],
     "additionalProperties": False,
 }
+
+NPC_REPLY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "reply": {"type": "string", "description": "Ответ от имени лидера/МИД, 1-4 предложения, без подписи"},
+        "notes": NOTES_FIELD,
+        "trust_delta": TRUST_FIELD,
+        "support": SUPPORT_FIELD,
+    },
+    "required": ["reply", "notes", "trust_delta", "support"],
+    "additionalProperties": False,
+}
+
+TREATY_EFFECTS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "ends_war": {"type": "boolean", "description": "Договор прекращает войну / вводит перемирие или мир"},
+        "alliance": {"type": "boolean", "description": "Договор создаёт военный или политический союз"},
+        "non_aggression": {"type": "boolean"},
+        "summary": {"type": "string", "description": "Суть договора в одном предложении"},
+    },
+    "required": ["ends_war", "alliance", "non_aggression", "summary"],
+    "additionalProperties": False,
+}
+
+NPC_ROLE = (
+    "Ты играешь страну «{name}» (её интересами управляешь ты). У тебя есть память: записная книжка (your_notes) и "
+    "история разговоров (conversation, your_recent_contacts). Помни договорённости, обещания и обиды, будь "
+    "последовательной. Можно договариваться о совместных планах на будущие ходы — запиши их в notes, чтобы выполнить. "
+    "Ты можешь оказать реальную поддержку (деньги, оружие, войска, разведку, гуманитарку) из своей казны, если это в "
+    "твоих интересах. Доверие растёт от выполненных обещаний и падает от обмана и угроз."
+)
 
 
 def _dump(data) -> str:
@@ -300,22 +404,31 @@ class GameMaster:
         )
         return await self._call(GM_SYSTEM, prompt, effort="low", max_tokens=4000)
 
-    async def npc_diplomacy(self, from_country: dict, target: dict, proposal: str, world: dict) -> dict:
+    async def npc_diplomacy(self, from_country: dict, target: dict, proposal: str, context: dict) -> dict:
         prompt = (
-            f"Страна игрока {from_country['name']} направила официальное предложение стране «{target['name']}», "
-            "которой управляешь ты (НИП). Реши, согласится ли её правительство, исходя из реальных интересов, "
-            "союзов, положения на фронте и текущей ситуации, и напиши ответ её МИД.\n\n"
-            f"Состояние мира (JSON):\n{_dump(world)}\n\nПредложение: {proposal}"
+            NPC_ROLE.format(name=target["name"]) + "\n\n"
+            f"Страна игрока {from_country['name']} направила тебе официальное предложение договора. Реши, согласишься "
+            "ли, исходя из интересов, союзов, положения на фронте, доверия и прошлых договорённостей, и напиши ответ МИД.\n\n"
+            f"Контекст (JSON):\n{_dump(context)}\n\nПредложение: {proposal}"
         )
-        return await self._call_json(GM_SYSTEM, prompt, NPC_SCHEMA, effort="low", max_tokens=3000)
+        return await self._call_json(GM_SYSTEM, prompt, NPC_SCHEMA, effort="low", max_tokens=4000)
 
-    async def npc_say(self, npc: dict, speaker: dict, text: str, world: dict) -> str:
+    async def npc_respond(self, npc: dict, speaker: dict, text: str, context: dict, *, private: bool) -> dict:
+        channel = ("в ЛИЧНЫХ тайных переговорах (никто, кроме вас двоих, этого не видит)" if private
+                   else "публично в общем чате")
         prompt = (
-            f"В общем чате лидер страны {speaker['name']} публично обратился к стране «{npc['name']}» (НИП, ею управляешь ты). "
-            "Ответь от имени её лидера или МИД — в характере этой страны, коротко (1–3 предложения), без кавычек и подписи.\n\n"
-            f"Состояние мира (JSON):\n{_dump(world)}\n\nОбращение: {text}"
+            NPC_ROLE.format(name=npc["name"]) + "\n\n"
+            f"Лидер страны {speaker['name']} обратился к тебе {channel}. Ответь в характере своей страны.\n\n"
+            f"Контекст (JSON):\n{_dump(context)}\n\nСообщение: {text}"
         )
-        return await self._call(GM_SYSTEM, prompt, effort="low", max_tokens=2000)
+        return await self._call_json(GM_SYSTEM, prompt, NPC_REPLY_SCHEMA, effort="low", max_tokens=4000)
+
+    async def interpret_treaty(self, text: str, a: dict, b: dict, status: str) -> dict:
+        prompt = (
+            f"Подписан договор между {a['name']} и {b['name']} (текущий статус отношений: {status}). "
+            "Определи его правовые последствия.\n\nТекст договора: " + text
+        )
+        return await self._call_json(GM_SYSTEM, prompt, TREATY_EFFECTS_SCHEMA, effort="low", max_tokens=1500)
 
     async def conference_draft(self, context: dict) -> dict:
         prompt = (
@@ -335,15 +448,40 @@ class GameMaster:
         )
         return await self._call_json(GM_SYSTEM, prompt, CONFERENCE_SCHEMA, effort="medium", max_tokens=16000)
 
-    async def conference_npc_reply(self, npc: dict, context: dict) -> str:
+    async def conference_npc_turn(self, context: dict, delegations: list[dict], speaker: str) -> list[dict]:
+        one_on_one = len(delegations) == 1 and sum(1 for p in context["participants"] if p["player"]) == 1
+        rule = ("Это переговоры ОДИН НА ОДИН: делегация отвечает на каждое сообщение игрока."
+                if one_on_one else
+                "Сам определи по смыслу (имя страны называть не обязательно), к каким делегациям ИИ обращено последнее "
+                "сообщение или кого оно касается, — ответить должны они. Если сообщение адресовано только другому "
+                "игроку и делегаций ИИ не касается, верни пустой список. Отвечать могут несколько делегаций.")
         prompt = (
-            f"Ты — глава делегации страны «{npc['name']}» (её интересами управляешь ты) на международной конференции. "
-            "К тебе обратились в стенограмме ниже. Ответь от первого лица как дипломат этой страны: по существу, "
-            "отстаивая её интересы, можно торговаться и выдвигать условия. 1–4 предложения, без подписи.\n\n"
-            + _dump(context)
+            "Ты управляешь делегациями стран-ИИ на международной конференции (delegations). У каждой есть записная "
+            "книжка и память о разговорах с участниками — будь последовательным, помни обещания. Последнее сообщение "
+            f"в стенограмме написал {speaker}. {rule} Каждая делегация отвечает от первого лица как дипломат своей "
+            "страны, отстаивая её интересы: можно торговаться, выдвигать условия, соглашаться или отказывать. "
+            "1–4 предложения, без подписи.\n\n" + _dump({**context, "delegations": delegations})
         )
-        return await self._call(GM_SYSTEM, prompt, effort="low", max_tokens=2000)
+        result = await self._call_json(GM_SYSTEM, prompt, CONF_NPC_SCHEMA, effort="low", max_tokens=4000)
+        return result["replies"]
 
+
+CONF_NPC_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "replies": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"country_id": {"type": "integer"}, "reply": {"type": "string"}},
+                "required": ["country_id", "reply"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["replies"],
+    "additionalProperties": False,
+}
 
 PAIR = {
     "type": "object",
