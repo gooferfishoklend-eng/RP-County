@@ -59,6 +59,26 @@ def base_stats(info: CountryInfo) -> dict:
     }
 
 
+REAL_ALLIANCES = [
+    {
+        "name": "НАТО",
+        "leader": "USA",
+        "charter": "Североатлантический договор: вооружённое нападение на одного из членов считается нападением на "
+                   "всех (статья 5). Коллективная оборона, общее командование, расходы на оборону от 2% ВВП.",
+        "members": ["USA", "GBR", "FRA", "DEU", "ITA", "CAN", "TUR", "POL", "ESP", "NLD", "BEL", "NOR", "DNK", "PRT",
+                    "GRC", "CZE", "HUN", "ROU", "BGR", "SVK", "SVN", "HRV", "ALB", "MNE", "MKD", "EST", "LVA", "LTU",
+                    "LUX", "ISL", "FIN", "SWE"],
+    },
+    {
+        "name": "ОДКБ",
+        "leader": "RUS",
+        "charter": "Договор о коллективной безопасности: агрессия против одного из участников — агрессия против всех, "
+                   "коллективные силы оперативного реагирования. Армения заморозила участие в 2024 году.",
+        "members": ["RUS", "BLR", "KAZ", "KGZ", "TJK"],
+    },
+]
+
+
 def initial_countries(world: World) -> list[dict]:
     rows = []
     for code, info in sorted(world.countries.items()):

@@ -213,3 +213,36 @@ async def test_npcs_talk_to_each_other_and_call_summits(db):
     await db.set_game_flag(CHAT, "npc_chat", False)
     outcome = await resolve_turn(db, TalkGM(), CHAT)
     assert outcome.npc_messages == [] and outcome.npc_dms == [] and outcome.summits == []
+
+
+async def test_real_alliances_seeded(db, tmp_path):
+    from bot.game import seed_alliances
+
+    nato = await db.alliance_by_name(CHAT, "НАТО")
+    csto = await db.alliance_by_name(CHAT, "ОДКБ")
+    assert len(await db.alliance_members(nato["id"])) == 32 and len(await db.alliance_members(csto["id"])) == 5
+    usa, fra = await db.get_country_by_code(CHAT, "USA"), await db.get_country_by_code(CHAT, "FRA")
+    assert nato["leader_id"] == usa["id"]
+    assert (await db.get_relation(CHAT, usa["id"], fra["id"]))["status"] == "alliance"
+    assert await seed_alliances(db, CHAT) == []  # idempotent
+
+    # a running game without blocs gets them, but players already in their own alliance are left alone
+    db2 = Database(str(tmp_path / "running.db"))
+    await db2.connect()
+    await new_game(db2, -200, "Идёт", 1)
+    for a in await db2.list_alliances(-200):
+        await db2.conn.execute("DELETE FROM alliance_members WHERE alliance_id = ?", (a["id"],))
+        await db2.conn.execute("DELETE FROM alliances WHERE id = ?", (a["id"],))
+    await db2.conn.commit()
+    pol = await db2.get_country_by_code(-200, "POL")
+    grc, tur = await db2.get_country_by_code(-200, "GRC"), await db2.get_country_by_code(-200, "TUR")
+    await db2.change_relation(-200, grc["id"], tur["id"], -40, "war")
+    await db2.create_alliance(-200, "Междуморье", "", pol["id"], 1)
+    assert await seed_alliances(db2, -200) == ["НАТО", "ОДКБ"]
+    nato2 = await db2.alliance_by_name(-200, "НАТО")
+    assert pol["id"] not in await db2.alliance_members(nato2["id"])
+    members = await db2.alliance_members(nato2["id"])
+    assert (grc["id"] in members) != (tur["id"] in members)  # warring countries never end up allied
+    await db2.update_alliance(nato2["id"], status="dissolved")
+    assert await seed_alliances(db2, -200) == []  # a dissolved NATO is not recreated
+    await db2.close()

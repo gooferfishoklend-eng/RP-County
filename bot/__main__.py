@@ -9,7 +9,7 @@ from aiogram.types import BotCommand
 from bot.ai import GameMaster
 from bot.config import load_settings
 from bot.db import Database
-from bot.game import repair_signed_peace
+from bot.game import repair_signed_peace, seed_alliances
 from bot.geo import load_world
 from bot.llm import make_backend
 from bot.handlers import setup_routers
@@ -62,6 +62,9 @@ async def main() -> None:
 
     db = Database(settings.db_path)
     await db.connect()
+    for game in await db._all("SELECT chat_id FROM games WHERE status = 'active'"):
+        for name in await seed_alliances(db, game["chat_id"]):
+            logging.info("created real-world alliance %s in game %s", name, game["chat_id"])
     if db.migrated_from == 3:
         for chat_id, a, b in await repair_signed_peace(db):
             logging.info("ended war %s-%s in %s: peace treaty was signed before the update", a, b, chat_id)

@@ -8,7 +8,7 @@ from bot.ai import AIError, GameMaster
 from bot.db import Database
 from bot.geo import World, load_world
 from bot.mapdraw import MapView
-from bot.seed import initial_cells, initial_countries
+from bot.seed import REAL_ALLIANCES, initial_cells, initial_countries
 from bot.stats import STAT_KEYS, apply_deltas, power_index
 from bot.alliance import snapshot as alliances_snapshot
 from bot.support import KINDS as SUPPORT_KINDS, give_support, support_bonus
@@ -63,6 +63,36 @@ class TurnOutcome:
 async def new_game(db: Database, chat_id: int, title: str, user_id: int) -> None:
     world = await asyncio.to_thread(load_world)
     await db.create_game(chat_id, title, user_id, initial_countries(world), initial_cells(world))
+    await seed_alliances(db, chat_id)
+
+
+async def seed_alliances(db: Database, chat_id: int) -> list[str]:
+    """Create the real-world blocs (NATO, CSTO) unless the game already has or had them.
+
+    Countries already in another alliance, or at war with a member, are left out.
+    """
+    game = await db.get_game(chat_id)
+    created = []
+    for spec in REAL_ALLIANCES:
+        if await db.alliance_by_name(chat_id, spec["name"]):
+            continue
+        members = [c for c in [await db.get_country_by_code(chat_id, code) for code in spec["members"]]
+                   if c and c["alive"]]
+        leader = next((c for c in members if c["code"] == spec["leader"]), None)
+        if not leader or await db.alliance_of(chat_id, leader["id"]):
+            continue
+        aid = await db.create_alliance(chat_id, spec["name"], spec["charter"], leader["id"], game["turn"])
+        wars = {frozenset(w) for w in await db.wars(chat_id)}
+        accepted = [leader["id"]]
+        for c in members:
+            if c["id"] == leader["id"] or await db.alliance_of(chat_id, c["id"]):
+                continue
+            if any(frozenset((c["id"], m)) in wars for m in accepted):
+                continue
+            accepted.append(c["id"])
+        await db.add_alliance_members_bulk(chat_id, aid, accepted[1:], game["turn"])
+        created.append(spec["name"])
+    return created
 
 
 def country_brief(c: dict) -> dict:

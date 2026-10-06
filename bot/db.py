@@ -752,6 +752,11 @@ class Database:
     async def list_alliances(self, chat_id: int) -> list[dict]:
         return await self._all("SELECT * FROM alliances WHERE chat_id = ? AND status = 'active' ORDER BY id", (chat_id,))
 
+    async def alliance_by_name(self, chat_id: int, name: str) -> dict | None:
+        """Any alliance with this name, including dissolved ones."""
+        return await self._one("SELECT * FROM alliances WHERE chat_id = ? AND name = ? ORDER BY id DESC LIMIT 1",
+                               (chat_id, name))
+
     async def alliance_of(self, chat_id: int, country_id: int) -> dict | None:
         return await self._one(
             "SELECT a.* FROM alliances a JOIN alliance_members m ON m.alliance_id = a.id "
@@ -765,6 +770,21 @@ class Database:
     async def add_alliance_member(self, alliance_id: int, country_id: int, turn: int) -> None:
         await self._exec("INSERT OR IGNORE INTO alliance_members (alliance_id, country_id, joined_turn) VALUES (?, ?, ?)",
                          (alliance_id, country_id, turn))
+
+    async def add_alliance_members_bulk(self, chat_id: int, alliance_id: int, country_ids: list[int], turn: int) -> None:
+        """Add many members at once and mark every pair of members as allies (+15 relations)."""
+        members = await self.alliance_members(alliance_id) + [c for c in country_ids]
+        pairs = {_pair(a, b) for i, a in enumerate(members) for b in members[i + 1:] if a != b}
+        await self.conn.executemany(
+            "INSERT INTO relations (chat_id, a_id, b_id, value, status) VALUES (?, ?, ?, 15, 'alliance') "
+            "ON CONFLICT (chat_id, a_id, b_id) DO UPDATE SET value = min(100, value + 15), status = 'alliance'",
+            [(chat_id, a, b) for a, b in pairs],
+        )
+        await self.conn.executemany(
+            "INSERT OR IGNORE INTO alliance_members (alliance_id, country_id, joined_turn) VALUES (?, ?, ?)",
+            [(alliance_id, cid, turn) for cid in country_ids],
+        )
+        await self.conn.commit()
 
     async def remove_alliance_member(self, alliance_id: int, country_id: int) -> None:
         await self._exec("DELETE FROM alliance_members WHERE alliance_id = ? AND country_id = ?", (alliance_id, country_id))
